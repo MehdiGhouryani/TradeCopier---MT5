@@ -42,18 +42,18 @@ async def send_telegram_alert(bot: Bot, message: str):
     except TelegramError as e:
         logger.error(f"Failed to send alert to Telegram: {e}")
 
-# --- Log Parsing Logic (بدون تغییر) ---
+# --- Log Parsing Logic (نسخه جدید با Source/Copy) ---
 def parse_and_format_log_line(line: str) -> str | None:
     line = line.strip()
     if "[TRADE_OPEN]" in line:
         try:
             parts = line.split("]")[1].strip().split(',')
-            return (f"✅ *پوزیشن جدید باز شد*\n\n*حساب:* `{parts[0]}`\n*نماد:* `{parts[1]}`\n*حجم:* `{parts[2]}`\n*قیمت باز شدن:* `{parts[3]}`\n*تیکت مستر:* `{parts[4]}`")
+            return (f"✅ *پوزیشن جدید باز شد*\n\n*حساب کپی:* `{parts[0]}`\n*نماد:* `{parts[1]}`\n*حجم:* `{parts[2]}`\n*قیمت باز شدن:* `{parts[3]}`\n*تیکت سورس:* `{parts[4]}`")
         except IndexError: return f"⚠️ *خطا در تجزیه لاگ باز شدن پوزیشن*\n`{line}`"
     elif "[TRADE_CLOSE]" in line:
         try:
             parts = line.split("]")[1].strip().split(',')
-            return (f"☑️ *پوزیشن بسته شد*\n\n*حساب:* `{parts[0]}`\n*نماد:* `{parts[1]}`\n*تیکت مستر:* `{parts[2]}`")
+            return (f"☑️ *پوزیشن بسته شد*\n\n*حساب کپی:* `{parts[0]}`\n*نماد:* `{parts[1]}`\n*تیکت سورس:* `{parts[2]}`")
         except IndexError: return f"⚠️ *خطا در تجزیه لاگ بسته شدن پوزیشن*\n`{line}`"
     elif "[DD_ALERT]" in line:
         try:

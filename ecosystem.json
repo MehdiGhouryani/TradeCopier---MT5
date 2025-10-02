@@ -1,27 +1,27 @@
 {
-  "masters": [
+  "sources": [
     {
-      "id": "master_1",
-      "name": "حساب اصلی پراپ",
-      "file_path": "TradeCopier_M1.txt",
-      "config_file": "master_1_config.txt",
+      "id": "source_1",
+      "name": "حساب سورس پراپ",
+      "file_path": "TradeCopier_S1.txt",
+      "config_file": "source_1_config.txt",
       "volume_settings": {
         "Multiplier": 2.0
       }
     },
     {
-      "id": "master_2",
+      "id": "source_2",
       "name": "حساب دوم (ریسک بالا)",
-      "file_path": "TradeCopier_M2.txt",
-      "config_file": "master_2_config.txt",
+      "file_path": "TradeCopier_S2.txt",
+      "config_file": "source_2_config.txt",
       "volume_settings": {
         "FixedVolume": 0.02
       }
     }
   ],
-  "slaves": [
+  "copies": [
     {
-      "id": "slave_A",
+      "id": "copy_A",
       "name": "حساب کپی شماره ۱",
       "settings": {
         "DailyDrawdownPercent": 4.5,
@@ -30,7 +30,7 @@
       }
     },
     {
-      "id": "slave_B",
+      "id": "copy_B",
       "name": "حساب کپی شماره ۲",
       "settings": {
         "DailyDrawdownPercent": 3.0,
@@ -40,12 +40,12 @@
     }
   ],
   "mapping": {
-    "slave_A": [
-      "master_1",
-      "master_2"
+    "copy_A": [
+      "source_1",
+      "source_2"
     ],
-    "slave_B": [
-      "master_1"
+    "copy_B": [
+      "source_1"
     ]
   }
 }
