@@ -2,27 +2,54 @@
   "sources": [
     {
       "id": "source_1",
-      "name": "حساب سورس پراپ",
+      "name": "سورس 1",
       "file_path": "TradeCopier_S1.txt",
       "config_file": "source_1_config.txt",
       "volume_settings": {
-        "Multiplier": 2.0
+        "FixedVolume": 0.1
       }
     },
     {
       "id": "source_2",
-      "name": "حساب دوم (ریسک بالا)",
+      "name": "سورس 2",
       "file_path": "TradeCopier_S2.txt",
       "config_file": "source_2_config.txt",
       "volume_settings": {
-        "FixedVolume": 0.02
+        "Multiplier": 3.0
+      }
+    },
+        {
+      "id": "source_3",
+      "name": " سورس 3",
+      "file_path": "TradeCopier_S3.txt",
+      "config_file": "source_3_config.txt",
+      "volume_settings": {
+        "FixedVolume": 0.1
+      }
+    },
+    {
+      "id": "source_4",
+      "name": "سورس 4",
+      "file_path": "TradeCopier_S4.txt",
+      "config_file": "source_4_config.txt",
+      "volume_settings": {
+        "FixedVolume": 0.1
+      }
+    },
+    {
+      "id": "source_5",
+      "name": "سورس 5",
+      "file_path": "TradeCopier_S5.txt",
+      "config_file": "source_5_config.txt",
+      "volume_settings": {
+        "FixedVolume": 0.1
       }
     }
   ],
   "copies": [
     {
       "id": "copy_A",
-      "name": "حساب کپی شماره ۱",
+      "name": "کپی 1",
       "settings": {
         "DailyDrawdownPercent": 4.5,
         "AlertDrawdownPercent": 4.0,
@@ -31,7 +58,7 @@
     },
     {
       "id": "copy_B",
-      "name": "حساب کپی شماره ۲",
+      "name": "کپی 2",
       "settings": {
         "DailyDrawdownPercent": 3.0,
         "AlertDrawdownPercent": 2.5,
