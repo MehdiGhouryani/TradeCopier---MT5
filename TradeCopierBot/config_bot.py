@@ -62,6 +62,46 @@ async def notify_admin_on_error(context: ContextTypes.DEFAULT_TYPE, function_nam
 
 # --- Ecosystem Helper Functions ---
 
+async def get_detailed_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Creates a detailed and formatted string of the entire system status."""
+    ecosystem = context.bot_data.get('ecosystem', {})
+    if not ecosystem:
+        return "❌ **خطا: اطلاعات سیستم بارگذاری نشده است.**"
+
+    source_map = {source_account['id']: source_account['name'] for source_account in ecosystem.get('sources', [])}
+    status_lines = ["**-- 🍃 وضعیت کامل سیستم --**"]
+
+    status_lines.append("\n**📊 حساب‌های سورس**")
+    sources = ecosystem.get('sources', [])
+    if not sources:
+        status_lines.append("  - هیچ سورس‌ای تعریف نشده است.")
+    else:
+        for source_account in sources:
+            vs = source_account.get('volume_settings', {})
+            mode = "حجم ثابت" if "FixedVolume" in vs else "ضریب"
+            value = vs.get("FixedVolume", vs.get("Multiplier", "N/A"))
+            status_lines.append(f"  - `{source_account['name']}`: *{mode} = {value}*")
+
+    status_lines.append("\n**🛡️ حساب‌های کپی**")
+    copies = ecosystem.get('copies', [])
+    if not copies:
+        status_lines.append("  - هیچ حساب کپی تعریف نشده است.")
+    else:
+        for copy_account in copies:
+            settings = copy_account.get('settings', {})
+            dd = float(settings.get("DailyDrawdownPercent", 0))
+            risk_status = f"فعال ({dd}%)" if dd > 0 else "غیرفعال"
+            
+            connections = ecosystem.get('mapping', {}).get(copy_account['id'], [])
+            connected_names = [source_map.get(conn['source_id'], conn['source_id']) for conn in connections]
+            connections_text = ", ".join(f"`{name}`" for name in connected_names) if connected_names else "_به هیچ سورس‌ای متصل نیست_"
+
+            status_lines.append(f"\n  - **{copy_account['name']}** (`{copy_account['id']}`)")
+            status_lines.append(f"    - ریسک: *{risk_status}*")
+            status_lines.append(f"    - اتصالات: {connections_text}")
+    
+    return "\n".join(status_lines)
+
 def load_ecosystem(application: Application) -> bool:
     """Loads the ecosystem data from the JSON file into bot_data for caching."""
     try:
@@ -102,18 +142,18 @@ def save_ecosystem(context: ContextTypes.DEFAULT_TYPE) -> bool:
         logger.error(f"Error saving ecosystem file: {e}", exc_info=True)
         return False
 
-def regenerate_all_configs(context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def regenerate_all_configs(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Regenerates ALL config files for all sources and copies."""
     ecosystem = context.bot_data.get('ecosystem', {})
     copies = ecosystem.get('copies', [])
     
     # Regenerate all copy connections and settings files
     for copy_account in copies:
-        regenerate_copy_config(copy_account['id'], context)
-        regenerate_copy_settings_config(copy_account['id'], context)
+        await regenerate_copy_config(copy_account['id'], context)
+        await regenerate_copy_settings_config(copy_account['id'], context)
         
     # Regenerate all source volume files
-    regenerate_source_volume_configs(context)
+    await regenerate_source_volume_configs(context)
     logger.info("All configuration files have been regenerated.")
     return True
 
@@ -122,9 +162,16 @@ async def regenerate_copy_config(copy_id: str, context: ContextTypes.DEFAULT_TYP
     (نسخه اتمی) فایل کانفیگ اتصالات (_sources.cfg) را برای یک حساب کپی بازسازی می‌کند.
     """
     ecosystem = context.bot_data.get('ecosystem', {})
-    connected_source_ids = ecosystem.get('mapping', {}).get(copy_id, [])
+    connections = ecosystem.get('mapping', {}).get(copy_id, [])
     all_sources = {source_account['id']: source_account for source_account in ecosystem.get('sources', [])}
-    content = [f"{all_sources[s_id]['file_path']},{all_sources[s_id]['config_file']}" for s_id in connected_source_ids if s_id in all_sources]
+    content = []
+    for conn in connections:
+        s_id = conn.get('source_id')
+        if s_id in all_sources:
+            mode = conn.get('mode', 'ALL')
+            allowed_symbols = conn.get('allowed_symbols', '') if mode == 'SYMBOLS' else ''
+            line = f"{all_sources[s_id]['file_path']},{all_sources[s_id]['config_file']},{mode},{allowed_symbols}"
+            content.append(line)
     
     cfg_path = os.path.join(os.path.dirname(ECOSYSTEM_PATH), f"{copy_id}_sources.cfg")
     tmp_path = cfg_path + ".tmp"
@@ -292,255 +339,232 @@ async def get_log_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Handles the /getlog command to fetch the latest log file for a copy."""
     args = context.args
     if not args:
-        await update.message.reply_text(
-            "فرمت دستور اشتباه است.\n"
-            "استفاده صحیح: `/getlog <copy_id> [تعداد_خطوط]`\n"
-            "مثال: `/getlog copy_A 50`",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await update.message.reply_text("لطفاً ID حساب کپی و (اختیاری) تعداد خطوط را وارد کنید. مثال: /getlog copy_A 50")
         return
 
     copy_id = args[0]
-    num_lines = int(args[1]) if len(args) > 1 and args[1].isdigit() else 20
+    num_lines = int(args[1]) if len(args) > 1 else 50  # پیش‌فرض 50 خط آخر
 
     if not LOG_DIRECTORY_PATH:
-        await update.message.reply_text("❌ خطا: مسیر پوشه لاگ‌ها در سرور تنظیم نشده است.")
-        logger.error("LOG_DIRECTORY_PATH environment variable is not set.")
+        await update.message.reply_text("❌ خطا: مسیر پوشه لاگ‌ها تنظیم نشده است.")
         return
 
     try:
         log_pattern = os.path.join(LOG_DIRECTORY_PATH, f"TradeCopier_{copy_id}_*.log")
-        list_of_files = glob.glob(log_pattern)
-        
-        if not list_of_files:
-            await update.message.reply_text(f"هیچ فایل لاگی برای کپی `{copy_id}` یافت نشد.", parse_mode=ParseMode.MARKDOWN)
+        all_logs = glob.glob(log_pattern)
+        if not all_logs:
+            await update.message.reply_text(f"❌ لاگی برای {copy_id} یافت نشد.")
             return
 
-        latest_file = max(list_of_files, key=os.path.getctime)
-        
-        with open(latest_file, 'r', encoding='utf-8') as f:
+        latest_log = max(all_logs, key=os.path.getctime)
+        with open(latest_log, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        
-        last_lines = lines[-num_lines:]
-        
-        if not last_lines:
-            await update.message.reply_text(f"فایل لاگ `{os.path.basename(latest_file)}` خالی است.", parse_mode=ParseMode.MARKDOWN)
-            return
+            tail_lines = lines[-num_lines:] if num_lines > 0 else lines
 
-        message = f"📄 *آخرین {len(last_lines)} خط از لاگ برای `{copy_id}`*\n"
-        message += f"*فایل:* `{os.path.basename(latest_file)}`\n\n"
-        message += "```\n"
-        message += "".join(last_lines)
-        message += "```"
-
-        MAX_MESSAGE_LENGTH = 4096
-        if len(message) > MAX_MESSAGE_LENGTH:
-            await update.message.reply_text(
-                f"📄 *آخرین {len(last_lines)} خط از لاگ برای `{copy_id}`*\n"
-                f"*فایل:* `{os.path.basename(latest_file)}`\n\n"
-                "محتوای لاگ بیش از حد طولانی است و به صورت فایل متنی ارسال می‌شود."
-            )
-            log_output_path = os.path.join(os.path.dirname(__file__), f"log_{copy_id}.txt")
-            with open(log_output_path, "w", encoding="utf-8") as f:
-                f.write("".join(last_lines))
-            await update.message.reply_document(document=open(log_output_path, 'rb'))
-            os.remove(log_output_path)
+        log_content = ''.join(tail_lines)
+        if len(log_content) > 4096:  # محدودیت پیام تلگرام
+            temp_file = f"{copy_id}_log.txt"
+            with open(temp_file, 'w', encoding='utf-8') as temp:
+                temp.write(log_content)
+            await update.message.reply_document(document=open(temp_file, 'rb'))
+            os.remove(temp_file)
         else:
-            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"لاگ {copy_id}:\n```{log_content}```", parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
-        await update.message.reply_text(f"❌ یک خطای پیش‌بینی نشده در خواندن فایل لاگ رخ داد: {e}")
+        await update.message.reply_text(f"❌ خطا در دریافت لاگ: {e}")
         logger.error(f"Error in get_log_handler: {e}", exc_info=True)
 
-async def get_detailed_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Creates a detailed and formatted string of the entire system status."""
-    ecosystem = context.bot_data.get('ecosystem', {})
-    if not ecosystem:
-        return "❌ **خطا: اطلاعات سیستم بارگذاری نشده است.**"
-
-    source_map = {source_account['id']: source_account['name'] for source_account in ecosystem.get('sources', [])}
-    status_lines = ["**-- 🍃 وضعیت کامل سیستم --**"]
-
-    status_lines.append("\n**📊 حساب‌های سورس**")
-    sources = ecosystem.get('sources', [])
-    if not sources:
-        status_lines.append("  - هیچ سورس‌ای تعریف نشده است.")
+@allowed_users_only
+async def regenerate_all_files_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the 'بازسازی تمام فایل‌ها' button."""
+    query = update.callback_query
+    await query.answer()
+    if await regenerate_all_configs(context): 
+        await query.edit_message_text("✅ تمام فایل‌های کانفیگ با موفقیت بازسازی شدند.")
     else:
-        for source_account in sources:
-            vs = source_account.get('volume_settings', {})
-            mode = "حجم ثابت" if "FixedVolume" in vs else "ضریب"
-            value = vs.get("FixedVolume", vs.get("Multiplier", "N/A"))
-            status_lines.append(f"  - `{source_account['name']}`: *{mode} = {value}*")
+        await query.edit_message_text("❌ خطا در بازسازی فایل‌ها. لطفاً لاگ‌ها را بررسی کنید.")
 
-    status_lines.append("\n**🛡️ حساب‌های کپی**")
-    copies = ecosystem.get('copies', [])
-    if not copies:
-        status_lines.append("  - هیچ حساب کپی تعریف نشده است.")
-    else:
-        for copy_account in copies:
-            settings = copy_account.get('settings', {})
-            dd = float(settings.get("DailyDrawdownPercent", 0))
-            risk_status = f"فعال ({dd}%)" if dd > 0 else "غیرفعال"
-            copy_mode = "تمام نمادها" if settings.get("CopySymbolMode", "GOLD_ONLY") == "ALL" else "فقط طلا"
-            
-            connected_ids = ecosystem.get('mapping', {}).get(copy_account['id'], [])
-            connected_names = [source_map.get(sid, sid) for sid in connected_ids]
-            connections_text = ", ".join(f"`{name}`" for name in connected_names) if connected_names else "_به هیچ سورس‌ای متصل نیست_"
-
-            status_lines.append(f"\n  - **{copy_account['name']}** (`{copy_account['id']}`)")
-            status_lines.append(f"    - ریسک: *{risk_status}* | کپی: *{copy_mode}*")
-            status_lines.append(f"    - اتصالات: {connections_text}")
-    
-    return "\n".join(status_lines)
+@allowed_users_only
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the 'راهنما' button."""
+    query = update.callback_query
+    await query.answer()
+    help_text = (
+        "راهنمای ربات مدیریت اکوسیستم:\n\n"
+        "/start - شروع ربات و نمایش منو اصلی\n"
+        "/getlog [copy_id] [lines] - دریافت آخرین لاگ برای یک حساب کپی (پیش‌فرض 50 خط)\n"
+        "/clean_old_logs - پاکسازی لاگ‌های قدیمی\n\n"
+        "منوها:\n"
+        "- مدیریت اتصالات: اتصال سورس به کپی\n"
+        "- تنظیمات حساب‌های کپی: مدیریت ریسک و حالت کپی\n"
+        "- تنظیمات حجم سورس‌ها: Fixed یا Multiplier\n"
+        "- بازسازی فایل‌ها: تولید مجدد تمام کانفیگ‌ها"
+    )
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")]]
+    await query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 @allowed_users_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Displays the main menu with a detailed status."""
     status_text = await get_detailed_status_text(context)
-    keyboard = InlineKeyboardMarkup([
+    keyboard = [
         [InlineKeyboardButton("⛓️ مدیریت اتصالات", callback_data="menu_connections")],
         [InlineKeyboardButton("🛡️ تنظیمات حساب‌های کپی", callback_data="menu_copy_settings")],
         [InlineKeyboardButton("📊 تنظیمات حجم سورس‌ها", callback_data="menu_volume_settings")],
         [InlineKeyboardButton("🔄 بازتولید تمام فایل‌ها", callback_data="regenerate_all_files")],
         [InlineKeyboardButton("ℹ️ راهنما", callback_data="menu_help")],
-    ])
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
     message = f"{status_text}\n\nلطفاً بخش مورد نظر را برای مدیریت انتخاب کنید:"
     
     if update.callback_query:
-        await update.callback_query.edit_message_text(message, reply_markup=keyboard, parse_mode='Markdown')
+        await update.callback_query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
     else:
-        await update.message.reply_text(message, reply_markup=keyboard, parse_mode='Markdown')
+        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
 
-@allowed_users_only
-async def regenerate_all_files_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """(نسخه async) تمام فایل‌های کانفیگ را بازسازی می‌کند."""
-    query = update.callback_query
-    await query.answer("⏳ در حال بازتولید تمام فایل‌های کانفیگ...")
-    
-    ecosystem = context.bot_data.get('ecosystem', {})
-    copies = ecosystem.get('copies', [])
-    all_success = True
 
-    for copy_account in copies:
-        if not await regenerate_copy_config(copy_account['id'], context) or \
-           not await regenerate_copy_settings_config(copy_account['id'], context):
-            all_success = False
-    
-    if not await regenerate_source_volume_configs(context):
-        all_success = False
-    
-    if all_success:
-        logger.info("All configuration files have been regenerated successfully.")
-        await query.answer("✅ تمام فایل‌ها با موفقیت بازتولید شدند!", show_alert=True)
-    else:
-        logger.error("An error occurred during the regeneration of all config files.")
-        await query.answer("❌ خطا در بازتولید برخی از فایل‌ها! لاگ‌ها را بررسی کنید.", show_alert=True)
 
-async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Displays the help message and a back button."""
-    query = update.callback_query
-    await query.answer()
-    
-    help_text = """
-===============
 
-*⛓️ اتصالات:*
-انتخاب حساب کپی و فعال/غیرفعال کردن اتصال سورس‌ها.
-
-*🛡️ تنظیمات حساب‌های کپی:*
-تنظیم DD، حالت کپی (طلا/همه) و ریست کردن قفل اکسپرت.
-
-*📊 حجم سورس‌ها:*
-تنظیم نحوه کپی حجم برای هر سورس (حجم ثابت / ضریب).
-
-*🔄 بازتولید فایل‌ها:*
-همگام‌سازی تمام اکسپرت‌ها با آخرین تغییرات ربات.
-
-----
-`/getlog <ID>`: مشاهده لاگ یک حساب کپی.
-
-`/clean_old_logs`: پاک کردن لاگ‌های قدیمی.
-"""
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]
-    ])
-    
-    await query.edit_message_text(
-        text=help_text,
-        reply_markup=keyboard,
-        parse_mode=ParseMode.MARKDOWN
-    )
-
+# --- کل تابع فعلی را حذف کرده و این نسخه را جایگزین کنید ---
 async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the connection management flow."""
+    """Handles the connections management flow with advanced symbol filtering."""
     query = update.callback_query
     await query.answer()
     data = query.data
     ecosystem = context.bot_data.get('ecosystem', {})
+
+    # START: Auto-migration for old mapping structure
+    for copy_id_key, connections_list in ecosystem.get('mapping', {}).items():
+        if connections_list and isinstance(connections_list[0], str):
+            logger.warning(f"Old mapping structure detected for '{copy_id_key}'. Migrating to new structure...")
+            new_connections = [{'source_id': src_id, 'mode': 'ALL'} for src_id in connections_list]
+            ecosystem['mapping'][copy_id_key] = new_connections
+            save_ecosystem(context)
+            break
+    # END: Auto-migration
 
     parts = data.split(':')
     action = parts[0]
-    
+
+    # --- نمایش منوی اصلی اتصالات (انتخاب حساب کپی) ---
     if action == "menu_connections":
         copies = ecosystem.get('copies', [])
-        keyboard = [[InlineKeyboardButton(f"{c['name']} ({c['id']})", callback_data=f"conn:select:{c['id']}")] for c in copies]
+        keyboard = [[InlineKeyboardButton(f"{c['name']} ({c['id']})", callback_data=f"conn:select_copy:{c['id']}")] for c in copies]
         keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")])
-        await query.edit_message_text("یک حساب کپی را برای مدیریت اتصالات انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text("یک حساب کپی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    if action == "conn" and parts[1] == "select":
+    # --- نمایش لیست سورس‌ها برای یک حساب کپی ---
+    if action == "conn" and parts[1] == "select_copy":
         copy_id = parts[2]
+        context.user_data['selected_copy_id'] = copy_id
+        copy_account = next((c for c in ecosystem.get('copies', []) if c['id'] == copy_id), None)
+        if not copy_account:
+            await query.edit_message_text("❌ خطا: حساب کپی یافت نشد.")
+            return
+
         sources = ecosystem.get('sources', [])
-        connected = ecosystem.get('mapping', {}).get(copy_id, [])
-        copy_name = next((c['name'] for c in ecosystem.get('copies', []) if c['id'] == copy_id), copy_id)
-        keyboard = [[InlineKeyboardButton(f"{'✅' if s['id'] in connected else '❌'} {s['name']}", callback_data=f"conn:toggle:{copy_id}:{s['id']}")] for s in sources]
+        connections = ecosystem.get('mapping', {}).get(copy_id, [])
+        connected_sources = {conn['source_id']: conn for conn in connections}
+
+        keyboard = []
+        for s in sources:
+            conn = connected_sources.get(s['id'])
+            status = f"متصل - {conn.get('mode', 'ALL')}" if conn else "غیرمتصل"
+            keyboard.append([InlineKeyboardButton(f"{s['name']} ({s['id']}) - {status}", callback_data=f"conn:manage_source:{s['id']}")])
         keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_connections")])
-        await query.edit_message_text(f"اتصالات حساب کپی **{copy_name}**:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await query.edit_message_text(f"اتصالات حساب کپی **{copy_account['name']}**:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return
 
-    if action == "conn" and parts[1] == "toggle":
-        copy_id = parts[2]
-        source_id = parts[3]
-        source_name = next((s['name'] for s in ecosystem.get('sources', []) if s['id'] == source_id), source_id)
-        keyboard = [[InlineKeyboardButton("✅ بله", callback_data=f"conn:confirm:{copy_id}:{source_id}"), InlineKeyboardButton("❌ لغو", callback_data=f"conn:select:{copy_id}")]]
-        await query.edit_message_text(f"آیا از تغییر اتصال به **{source_name}** مطمئن هستید؟", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    # --- نمایش منوی مدیریت برای یک سورس خاص ---
+    if action == "conn" and parts[1] == "manage_source":
+        source_id = parts[2]
+        context.user_data['selected_source_id'] = source_id
+        copy_id = context.user_data.get('selected_copy_id')
+        connections = ecosystem.get('mapping', {}).get(copy_id, [])
+        is_connected = any(c['source_id'] == source_id for c in connections)
+
+        toggle_text = "غیرفعال کردن اتصال" if is_connected else "فعال کردن اتصال"
+        keyboard = [
+            [InlineKeyboardButton(toggle_text, callback_data=f"conn:action:toggle_connection:{source_id}")]
+        ]
+        if is_connected:
+            keyboard.append([InlineKeyboardButton("تغییر حالت کپی", callback_data=f"conn:action:change_mode:{source_id}")])
+        keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"conn:select_copy:{copy_id}")])
+        await query.edit_message_text(f"مدیریت اتصال سورس {source_id}:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    if action == "conn" and parts[1] == "confirm":
-        copy_id = parts[2]
+    # --- منطق فعال/غیرفعال کردن اتصال ---
+    if action == "conn" and parts[1] == "action" and parts[2] == "toggle_connection":
         source_id = parts[3]
-        
-        await query.answer("⏳ در حال به‌روزرسانی...")
-        mapping = ecosystem.get('mapping', {})
-        connected = mapping.get(copy_id, [])
-        if source_id in connected:
-            connected.remove(source_id)
+        copy_id = context.user_data.get('selected_copy_id')
+        connections = ecosystem.get('mapping', {}).get(copy_id, [])
+        conn_index = next((i for i, c in enumerate(connections) if c['source_id'] == source_id), None)
+
+        if conn_index is not None:
+            del connections[conn_index]
         else:
-            connected.append(source_id)
-        
-        context.bot_data['ecosystem']['mapping'][copy_id] = connected
-        
+            connections.append({'source_id': source_id, 'mode': 'ALL'})
+
         if save_ecosystem(context) and await regenerate_copy_config(copy_id, context):
-            await query.answer("✅ انجام شد!")
+            await query.answer("✅ اتصال به‌روزرسانی شد.")
         else:
-            await query.answer("❌ خطا!")
+            await query.answer("❌ خطا در ذخیره‌سازی.")
         
-        sources = ecosystem.get('sources', [])
-        connected = ecosystem.get('mapping', {}).get(copy_id, [])
-        copy_name = next((c['name'] for c in ecosystem.get('copies', []) if c['id'] == copy_id), copy_id)
-        keyboard = [[InlineKeyboardButton(f"{'✅' if s['id'] in connected else '❌'} {s['name']}", callback_data=f"conn:toggle:{copy_id}:{s['id']}")] for s in sources]
-        keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_connections")])
-        await query.edit_message_text(f"اتصالات حساب کپی **{copy_name}**:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        # بازسازی و نمایش منوی لیست سورس‌ها
+        query.data = f"conn:select_copy:{copy_id}"
+        await _handle_connections_menu(update, context)
+        return
+
+    # --- نمایش منوی تغییر حالت کپی ---
+    if action == "conn" and parts[1] == "action" and parts[2] == "change_mode":
+        source_id = parts[3]
+        keyboard = [
+            [InlineKeyboardButton("کپی همه نمادها (ALL)", callback_data=f"conn:set_mode:{source_id}:ALL")],
+            [InlineKeyboardButton("فقط طلا (GOLD_ONLY)", callback_data=f"conn:set_mode:{source_id}:GOLD_ONLY")],
+            [InlineKeyboardButton("نمادهای خاص (SYMBOLS)", callback_data=f"conn:set_mode:{source_id}:SYMBOLS")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data=f"conn:manage_source:{source_id}")]
+        ]
+        await query.edit_message_text("حالت کپی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # --- منطق تنظیم حالت کپی ---
+    if action == "conn" and parts[1] == "set_mode":
+        source_id = parts[2]
+        mode = parts[3]
+        copy_id = context.user_data.get('selected_copy_id')
+        conn = next((c for c in ecosystem.get('mapping', {}).get(copy_id, []) if c['source_id'] == source_id), None)
+
+        if conn:
+            conn['mode'] = mode
+            if mode != 'SYMBOLS':
+                conn.pop('allowed_symbols', None)
+            
+            if save_ecosystem(context) and await regenerate_copy_config(copy_id, context):
+                await query.answer(f"✅ حالت به {mode} تغییر یافت.")
+            else:
+                await query.answer("❌ خطا در ذخیره‌سازی.")
+
+        if mode == 'SYMBOLS':
+            context.user_data['waiting_for'] = 'symbols'
+            await query.edit_message_text("لطفاً لیست نمادهای مورد نظر را با **سمی‌کالن ( ; )** از هم جدا کرده و ارسال کنید. مثال: `EURUSD;GBPUSD`", parse_mode='Markdown')
+            return
+
+        # بازسازی و نمایش منوی مدیریت سورس
+        query.data = f"conn:manage_source:{source_id}"
+        await _handle_connections_menu(update, context)
+        return
+
+
 
 async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the per-copy settings flow."""
     query = update.callback_query
     await query.answer()
     data = query.data
     ecosystem = context.bot_data.get('ecosystem', {})
-    
+
     parts = data.split(':')
     action = parts[0]
 
@@ -548,7 +572,7 @@ async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAU
         copies = ecosystem.get('copies', [])
         keyboard = [[InlineKeyboardButton(f"{c['name']} ({c['id']})", callback_data=f"setting:select:{c['id']}")] for c in copies]
         keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")])
-        await query.edit_message_text("یک حساب کپی را برای مدیریت تنظیمات انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text("یک حساب کپی را برای تنظیم انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if action == "setting" and parts[1] == "select":
@@ -663,49 +687,101 @@ async def _handle_volume_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         keyboard = [[InlineKeyboardButton("حجم ثابت (Fixed)", callback_data="vol_input_source_FixedVolume"), InlineKeyboardButton("ضریب (Multiplier)", callback_data="vol_input_source_Multiplier")], [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_volume_settings")]]
         await query.edit_message_text(f"سورس: **{source_account['name']}**\nوضعیت: `{mode}={value}`\n\nحالت حجم را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
+
+# --- این تابع کامل و بهبودیافته را کپی و جایگزین تابع قبلی کنید ---
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles all numerical inputs for settings."""
+    """
+    Handles all text inputs from the user, including numerical settings and symbol lists,
+    with improved error handling and state management.
+    """
     if not is_user_allowed(update.effective_user.id):
         return
+
     waiting_for = context.user_data.get('waiting_for')
     if not waiting_for:
         return
-    
-    try:
-        value = float(update.message.text)
-        ecosystem = context.bot_data['ecosystem']
-        
-        if waiting_for.startswith("copy_"):
-            key = waiting_for.replace("copy_", "")
-            copy_id = context.user_data.get('selected_copy_id')
-            copy_account = next((c for c in ecosystem.get('copies', []) if c['id'] == copy_id), None)
-            if not copy_account:
-                raise Exception("حساب کپی انتخاب شده یافت نشد.")
-            copy_account['settings'][key] = round(value, 2)
-            if save_ecosystem(context) and await regenerate_copy_settings_config(copy_id, context):
-                await update.message.reply_text("✅ تنظیمات حساب کپی ذخیره شد.")
-            else:
-                raise Exception("خطا در ذخیره سازی.")
-        
-        elif waiting_for.startswith("source_"):
-            key = waiting_for.replace("source_", "")
-            source_id = context.user_data.get('selected_source_id')
-            source_account = next((s for s in ecosystem.get('sources', []) if s['id'] == source_id), None)
-            if not source_account:
-                raise Exception("سورس انتخاب شده یافت نشد.")
-            source_account['volume_settings'] = {key: round(value, 2)}
-            if save_ecosystem(context) and await regenerate_source_volume_configs(context):
-                await update.message.reply_text("✅ تنظیمات حجم ذخیره شد.")
-            else:
-                raise Exception("خطا در ذخیره سازی.")
 
-        context.user_data.clear()
-        await start(update, context)
-    except (ValueError, TypeError):
-        await update.message.reply_text("❌ خطا: لطفاً فقط یک مقدار عددی معتبر (مثال: 4.7 یا 0.1) وارد کنید.")
+    text = update.message.text.strip()
+    ecosystem = context.bot_data.get('ecosystem', {})
+    should_return_to_main_menu = True
+
+    try:
+        # --- بخش مدیریت تنظیمات عددی ---
+        if waiting_for.startswith("copy_") or waiting_for.startswith("source_"):
+            try:
+                value = float(text)
+            except ValueError:
+                await update.message.reply_text("❌ خطا: ورودی باید یک عدد باشد. مثال: 4.7 یا 0.1")
+                return # منتظر ورودی صحیح بعدی می‌مانیم
+
+            if waiting_for.startswith("copy_"):
+                key = waiting_for.replace("copy_", "")
+                copy_id = context.user_data.get('selected_copy_id')
+                item = next((c for c in ecosystem.get('copies', []) if c['id'] == copy_id), None)
+                if not item:
+                    raise KeyError("حساب کپی انتخاب شده یافت نشد.")
+                item['settings'][key] = round(value, 2)
+                if save_ecosystem(context) and await regenerate_copy_settings_config(copy_id, context):
+                    await update.message.reply_text(f"✅ تنظیمات `{key}` برای `{copy_id}` ذخیره شد.")
+                else:
+                    raise IOError("خطا در ذخیره سازی یا بازسازی فایل کانفیگ حساب کپی.")
+
+            elif waiting_for.startswith("source_"):
+                key = waiting_for.replace("source_", "")
+                source_id = context.user_data.get('selected_source_id')
+                item = next((s for s in ecosystem.get('sources', []) if s['id'] == source_id), None)
+                if not item:
+                    raise KeyError("سورس انتخاب شده یافت نشد.")
+                item['volume_settings'] = {key: round(value, 2)}
+                if save_ecosystem(context) and await regenerate_source_volume_configs(context):
+                    await update.message.reply_text(f"✅ تنظیمات حجم برای `{source_id}` ذخیره شد.")
+                else:
+                    raise IOError("خطا در ذخیره سازی یا بازسازی فایل کانفیگ سورس.")
+
+        # --- بخش مدیریت لیست نمادها ---
+        elif waiting_for == "symbols":
+            copy_id = context.user_data.get('selected_copy_id')
+            source_id = context.user_data.get('selected_source_id')
+            if not copy_id or not source_id:
+                raise KeyError("اطلاعات حساب کپی یا سورس در حافظه موقت یافت نشد.")
+
+            symbols = [sym.strip().upper() for sym in text.split(';') if sym.strip()]
+            allowed_symbols_str = ';'.join(symbols)
+
+            conn = next((c for c in ecosystem.get('mapping', {}).get(copy_id, []) if c['source_id'] == source_id), None)
+            if not conn:
+                raise KeyError(f"اتصال بین {copy_id} و {source_id} یافت نشد.")
+            
+            conn['allowed_symbols'] = allowed_symbols_str
+            if save_ecosystem(context) and await regenerate_copy_config(copy_id, context):
+                await update.message.reply_text(f"✅ لیست نمادها برای اتصال `{source_id}` به `{copy_id}` با موفقیت ذخیره شد.")
+            else:
+                raise IOError("خطا در ذخیره سازی یا بازسازی فایل کانفیگ اتصالات.")
+        
+        else:
+            # اگر ربات منتظر ورودی ناشناخته‌ای بود
+            logger.warning(f"Unknown 'waiting_for' state: {waiting_for}")
+            should_return_to_main_menu = False
+
+
+    except KeyError as e:
+        await update.message.reply_text(f"❌ خطای منطقی: {e}. لطفاً دوباره از منوی اصلی شروع کنید.")
+        logger.error(f"KeyError in handle_text_input: {e}", exc_info=True)
+        should_return_to_main_menu = True
+    except IOError as e:
+        await update.message.reply_text(f"❌ خطای فایل: {e}. لطفاً لاگ‌های سرور را بررسی کنید.")
+        logger.error(f"IOError in handle_text_input: {e}", exc_info=True)
+        should_return_to_main_menu = True
     except Exception as e:
-        await update.message.reply_text(f"❌ خطا: {e}")
-        logger.error(f"Error in handle_text_input: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ یک خطای پیش‌بینی نشده رخ داد: {e}")
+        logger.error(f"Unhandled exception in handle_text_input: {e}", exc_info=True)
+        should_return_to_main_menu = True
+
+    finally:
+        # در هر صورت، چه موفقیت‌آمیز چه ناموفق، وضعیت را پاک کرده و به منوی اصلی بازگرد
+        if should_return_to_main_menu:
+            context.user_data.clear()
+            await start(update, context)
 
 async def text_input_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sets the state to wait for a text input."""
