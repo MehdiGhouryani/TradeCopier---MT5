@@ -426,19 +426,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
-
-# --- کل تابع فعلی را حذف کرده و این نسخه را جایگزین کنید ---
+# --- کل تابع فعلی را حذف کرده و این نسخه صحیح را جایگزین کنید ---
 async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the connections management flow with advanced symbol filtering."""
     query = update.callback_query
-    await query.answer()
+    # await query.answer() # برای جلوگیری از خطا، این خط به داخل شرط‌ها منتقل شد
     data = query.data
     ecosystem = context.bot_data.get('ecosystem', {})
 
     # START: Auto-migration for old mapping structure
     for copy_id_key, connections_list in ecosystem.get('mapping', {}).items():
         if connections_list and isinstance(connections_list[0], str):
-            logger.warning(f"Old mapping structure detected for '{copy_id_key}'. Migrating to new structure...")
+            logger.warning(f"Old mapping structure detected for '{copy_id_key}'. Migrating...")
             new_connections = [{'source_id': src_id, 'mode': 'ALL'} for src_id in connections_list]
             ecosystem['mapping'][copy_id_key] = new_connections
             save_ecosystem(context)
@@ -448,27 +447,38 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
     parts = data.split(':')
     action = parts[0]
 
-    # --- نمایش منوی اصلی اتصالات (انتخاب حساب کپی) ---
     if action == "menu_connections":
+        await query.answer()
         copies = ecosystem.get('copies', [])
         keyboard = [[InlineKeyboardButton(f"{c['name']} ({c['id']})", callback_data=f"conn:select_copy:{c['id']}")] for c in copies]
         keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")])
         await query.edit_message_text("یک حساب کپی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # --- نمایش لیست سورس‌ها برای یک حساب کپی ---
-    if action == "conn" and parts[1] == "select_copy":
+    copy_id = context.user_data.get('selected_copy_id')
+    if "select_copy" in data:
         copy_id = parts[2]
         context.user_data['selected_copy_id'] = copy_id
-        copy_account = next((c for c in ecosystem.get('copies', []) if c['id'] == copy_id), None)
-        if not copy_account:
-            await query.edit_message_text("❌ خطا: حساب کپی یافت نشد.")
-            return
 
+    if "select_copy" in data or ("action" in data and "toggle_connection" in data):
+        await query.answer()
+        if "toggle_connection" in data:
+            source_id = parts[3]
+            connections = ecosystem.get('mapping', {}).get(copy_id, [])
+            conn_index = next((i for i, c in enumerate(connections) if c['source_id'] == source_id), None)
+            if conn_index is not None:
+                del connections[conn_index]
+            else:
+                connections.append({'source_id': source_id, 'mode': 'ALL'})
+            if save_ecosystem(context) and await regenerate_copy_config(copy_id, context):
+                await query.answer("✅ اتصال به‌روزرسانی شد.")
+            else:
+                await query.answer("❌ خطا در ذخیره‌سازی.")
+
+        copy_account = next((c for c in ecosystem.get('copies', []) if c['id'] == copy_id), None)
         sources = ecosystem.get('sources', [])
         connections = ecosystem.get('mapping', {}).get(copy_id, [])
         connected_sources = {conn['source_id']: conn for conn in connections}
-
         keyboard = []
         for s in sources:
             conn = connected_sources.get(s['id'])
@@ -478,48 +488,42 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text(f"اتصالات حساب کپی **{copy_account['name']}**:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return
 
-    # --- نمایش منوی مدیریت برای یک سورس خاص ---
-    if action == "conn" and parts[1] == "manage_source":
+    source_id = context.user_data.get('selected_source_id')
+    if "manage_source" in data:
         source_id = parts[2]
         context.user_data['selected_source_id'] = source_id
-        copy_id = context.user_data.get('selected_copy_id')
+
+    if "manage_source" in data or "set_mode" in data:
+        if "set_mode" in data:
+            source_id = parts[2]
+            mode = parts[3]
+            conn = next((c for c in ecosystem.get('mapping', {}).get(copy_id, []) if c['source_id'] == source_id), None)
+            if conn:
+                conn['mode'] = mode
+                if mode != 'SYMBOLS':
+                    conn.pop('allowed_symbols', None)
+                if save_ecosystem(context) and await regenerate_copy_config(copy_id, context):
+                    await query.answer(f"✅ حالت به {mode} تغییر یافت.")
+                else:
+                    await query.answer("❌ خطا در ذخیره‌سازی.")
+            if mode == 'SYMBOLS':
+                context.user_data['waiting_for'] = 'symbols'
+                await query.edit_message_text("لطفاً لیست نمادهای مورد نظر را با **سمی‌کالن ( ; )** از هم جدا کرده و ارسال کنید. مثال: `EURUSD;GBPUSD`", parse_mode='Markdown')
+                return
+        
+        await query.answer()
         connections = ecosystem.get('mapping', {}).get(copy_id, [])
         is_connected = any(c['source_id'] == source_id for c in connections)
-
         toggle_text = "غیرفعال کردن اتصال" if is_connected else "فعال کردن اتصال"
-        keyboard = [
-            [InlineKeyboardButton(toggle_text, callback_data=f"conn:action:toggle_connection:{source_id}")]
-        ]
+        keyboard = [[InlineKeyboardButton(toggle_text, callback_data=f"conn:action:toggle_connection:{source_id}")]]
         if is_connected:
             keyboard.append([InlineKeyboardButton("تغییر حالت کپی", callback_data=f"conn:action:change_mode:{source_id}")])
         keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"conn:select_copy:{copy_id}")])
         await query.edit_message_text(f"مدیریت اتصال سورس {source_id}:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # --- منطق فعال/غیرفعال کردن اتصال ---
-    if action == "conn" and parts[1] == "action" and parts[2] == "toggle_connection":
-        source_id = parts[3]
-        copy_id = context.user_data.get('selected_copy_id')
-        connections = ecosystem.get('mapping', {}).get(copy_id, [])
-        conn_index = next((i for i, c in enumerate(connections) if c['source_id'] == source_id), None)
-
-        if conn_index is not None:
-            del connections[conn_index]
-        else:
-            connections.append({'source_id': source_id, 'mode': 'ALL'})
-
-        if save_ecosystem(context) and await regenerate_copy_config(copy_id, context):
-            await query.answer("✅ اتصال به‌روزرسانی شد.")
-        else:
-            await query.answer("❌ خطا در ذخیره‌سازی.")
-        
-        # بازسازی و نمایش منوی لیست سورس‌ها
-        query.data = f"conn:select_copy:{copy_id}"
-        await _handle_connections_menu(update, context)
-        return
-
-    # --- نمایش منوی تغییر حالت کپی ---
     if action == "conn" and parts[1] == "action" and parts[2] == "change_mode":
+        await query.answer()
         source_id = parts[3]
         keyboard = [
             [InlineKeyboardButton("کپی همه نمادها (ALL)", callback_data=f"conn:set_mode:{source_id}:ALL")],
@@ -528,33 +532,6 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
             [InlineKeyboardButton("🔙 بازگشت", callback_data=f"conn:manage_source:{source_id}")]
         ]
         await query.edit_message_text("حالت کپی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    # --- منطق تنظیم حالت کپی ---
-    if action == "conn" and parts[1] == "set_mode":
-        source_id = parts[2]
-        mode = parts[3]
-        copy_id = context.user_data.get('selected_copy_id')
-        conn = next((c for c in ecosystem.get('mapping', {}).get(copy_id, []) if c['source_id'] == source_id), None)
-
-        if conn:
-            conn['mode'] = mode
-            if mode != 'SYMBOLS':
-                conn.pop('allowed_symbols', None)
-            
-            if save_ecosystem(context) and await regenerate_copy_config(copy_id, context):
-                await query.answer(f"✅ حالت به {mode} تغییر یافت.")
-            else:
-                await query.answer("❌ خطا در ذخیره‌سازی.")
-
-        if mode == 'SYMBOLS':
-            context.user_data['waiting_for'] = 'symbols'
-            await query.edit_message_text("لطفاً لیست نمادهای مورد نظر را با **سمی‌کالن ( ; )** از هم جدا کرده و ارسال کنید. مثال: `EURUSD;GBPUSD`", parse_mode='Markdown')
-            return
-
-        # بازسازی و نمایش منوی مدیریت سورس
-        query.data = f"conn:manage_source:{source_id}"
-        await _handle_connections_menu(update, context)
         return
 
 
