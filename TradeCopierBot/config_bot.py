@@ -88,17 +88,21 @@ async def get_detailed_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         status_lines.append("  - هیچ حساب کپی تعریف نشده است.")
     else:
         for copy_account in copies:
+            copy_id = copy_account['id']
             settings = copy_account.get('settings', {})
             dd = float(settings.get("DailyDrawdownPercent", 0))
-            risk_status = f"فعال ({dd}%)" if dd > 0 else "غیرفعال"
+            risk_text = f"{dd}%" if dd > 0 else "غیرفعال"
             
-            connections = ecosystem.get('mapping', {}).get(copy_account['id'], [])
-            connected_names = [source_map.get(conn['source_id'], conn['source_id']) for conn in connections]
-            connections_text = ", ".join(f"`{name}`" for name in connected_names) if connected_names else "_به هیچ سورس‌ای متصل نیست_"
+            # بررسی وجود فایل نشانگر برای تشخیص وضعیت توقف
+            flag_file_path = os.path.join(os.path.dirname(ECOSYSTEM_PATH), f"{copy_id}_stopped.flag")
+            status_emoji = "🔴" if os.path.exists(flag_file_path) else "🟢"
+            status_text = " (متوقف)" if status_emoji == "🔴" else ""
 
-            status_lines.append(f"\n  - **{copy_account['name']}** (`{copy_account['id']}`)")
-            status_lines.append(f"    - ریسک: *{risk_status}*")
-            status_lines.append(f"    - اتصالات: {connections_text}")
+            connection_count = len(ecosystem.get('mapping', {}).get(copy_id, []))
+
+            status_lines.append(
+                f"{status_emoji} `{copy_account['name']}`: ریسک: *{risk_text}* | متصل به *{connection_count} سورس*{status_text}"
+            )
     
     return "\n".join(status_lines)
 
@@ -411,7 +415,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [
         [InlineKeyboardButton("⛓️ مدیریت اتصالات", callback_data="menu_connections")],
         [InlineKeyboardButton("🛡️ تنظیمات حساب‌های کپی", callback_data="menu_copy_settings")],
-        [InlineKeyboardButton("📊 تنظیمات حجم سورس‌ها", callback_data="menu_volume_settings")],
+        [InlineKeyboardButton("🗂️ مدیریت سورس‌ها", callback_data="sources:main")], # << این خط جایگزین شده
         [InlineKeyboardButton("🔄 بازتولید تمام فایل‌ها", callback_data="regenerate_all_files")],
         [InlineKeyboardButton("ℹ️ راهنما", callback_data="menu_help")],
     ]
@@ -633,39 +637,67 @@ async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAU
         ]
         await query.edit_message_text(f"تنظیمات حساب کپی **{copy_account['name']}**:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
-async def _handle_volume_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the source volume settings flow."""
+async def _handle_sources_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the unified source management flow (name and volume)."""
     query = update.callback_query
     await query.answer()
     data = query.data
     ecosystem = context.bot_data.get('ecosystem', {})
-
     parts = data.split(':')
-    action = parts[0]
+    action = parts[1]
 
-    if action == "menu_volume_settings":
+    # Level 1: Main source menu (List all sources)
+    if action == "main":
         sources = ecosystem.get('sources', [])
-        keyboard = [[InlineKeyboardButton(f"{s['name']} ({s['id']})", callback_data=f"vol:select:{s['id']}")] for s in sources]
+        keyboard = []
+        for s in sources:
+            vs = s.get('volume_settings', {})
+            mode = "Fixed" if "FixedVolume" in vs else "Multiplier"
+            value = vs.get("FixedVolume", vs.get("Multiplier", "N/A"))
+            # نمایش نام و وضعیت حجم در یک خط
+            button_text = f"{s['name']} ({mode}: {value})"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"sources:select:{s['id']}")])
+        
         keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")])
-        await query.edit_message_text("یک سورس را برای تنظیم حجم انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text("یک سورس را برای مدیریت انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    if action == "vol" and parts[1] == "select":
+    # Level 2: Options for a selected source
+    if action == "select":
         source_id = parts[2]
         context.user_data['selected_source_id'] = source_id
-        source_account = next((s for s in ecosystem.get('sources', []) if s['id'] == source_id), None)
-        if not source_account:
+        source = next((s for s in ecosystem.get('sources', []) if s['id'] == source_id), None)
+        if not source:
             await query.edit_message_text("❌ خطا: سورس یافت نشد.")
             return
+        
+        keyboard = [
+            [InlineKeyboardButton("✏️ ویرایش نام", callback_data=f"sources:action:edit_name")],
+            [InlineKeyboardButton("⚙️ تنظیم حجم", callback_data=f"sources:action:edit_volume")],
+            [InlineKeyboardButton("🔙 بازگشت به لیست سورس‌ها", callback_data="sources:main")]
+        ]
+        await query.edit_message_text(f"مدیریت سورس: **{source['name']}**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        return
 
-        vs = source_account.get('volume_settings', {})
-        mode = "FixedVolume" if "FixedVolume" in vs else "Multiplier"
-        value = vs.get(mode, "N/A")
-        keyboard = [[InlineKeyboardButton("حجم ثابت (Fixed)", callback_data="vol_input_source_FixedVolume"), InlineKeyboardButton("ضریب (Multiplier)", callback_data="vol_input_source_Multiplier")], [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_volume_settings")]]
-        await query.edit_message_text(f"سورس: **{source_account['name']}**\nوضعیت: `{mode}={value}`\n\nحالت حجم را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    # Level 3: Actions (edit_name, edit_volume)
+    if action == "action":
+        sub_action = parts[2]
+        source_id = context.user_data.get('selected_source_id')
+        if sub_action == "edit_name":
+            context.user_data['waiting_for'] = 'source_name_edit'
+            await query.edit_message_text("لطفاً نام نمایشی جدید را برای این سورس ارسال کنید:")
+        
+        elif sub_action == "edit_volume":
+            # این بخش دقیقا همان منطق منوی قدیمی حجم را فراخوانی می‌کند
+            keyboard = [
+                [InlineKeyboardButton("حجم ثابت (Fixed)", callback_data="vol_input_source_FixedVolume")],
+                [InlineKeyboardButton("ضریب (Multiplier)", callback_data="vol_input_source_Multiplier")],
+                [InlineKeyboardButton("🔙 بازگشت", callback_data=f"sources:select:{source_id}")]
+            ]
+            await query.edit_message_text("حالت حجم را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-# --- این تابع کامل و بهبودیافته را کپی و جایگزین تابع قبلی کنید ---
+
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handles all text inputs from the user, including numerical settings and symbol lists,
@@ -683,13 +715,46 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     should_return_to_main_menu = True
 
     try:
-        # --- بخش مدیریت تنظیمات عددی ---
-        if waiting_for.startswith("copy_") or waiting_for.startswith("source_"):
+        # --- اولویت ۱: مدیریت ورودی‌های متنی خاص ---
+        if waiting_for == "source_name_edit":
+            source_id = context.user_data.get('selected_source_id')
+            source = next((s for s in ecosystem.get('sources', []) if s['id'] == source_id), None)
+            if not source:
+                raise KeyError("سورس انتخاب شده یافت نشد.")
+            
+            source['name'] = text  # به‌روزرسانی نام
+            
+            if save_ecosystem(context):
+                await update.message.reply_text(f"✅ نام سورس `{source_id}` با موفقیت به '{text}' تغییر یافت.")
+            else:
+                raise IOError("خطا در ذخیره سازی فایل ecosystem.json.")
+
+        elif waiting_for == "symbols":
+            copy_id = context.user_data.get('selected_copy_id')
+            source_id = context.user_data.get('selected_source_id')
+            if not copy_id or not source_id:
+                raise KeyError("اطلاعات حساب کپی یا سورس در حافظه موقت یافت نشد.")
+
+            symbols = [sym.strip().upper() for sym in text.split(';') if sym.strip()]
+            allowed_symbols_str = ';'.join(symbols)
+
+            conn = next((c for c in ecosystem.get('mapping', {}).get(copy_id, []) if c['source_id'] == source_id), None)
+            if not conn:
+                raise KeyError(f"اتصال بین {copy_id} و {source_id} یافت نشد.")
+            
+            conn['allowed_symbols'] = allowed_symbols_str
+            if save_ecosystem(context) and await regenerate_copy_config(copy_id, context):
+                await update.message.reply_text(f"✅ لیست نمادها برای اتصال `{source_id}` به `{copy_id}` با موفقیت ذخیره شد.")
+            else:
+                raise IOError("خطا در ذخیره سازی یا بازسازی فایل کانفیگ اتصالات.")
+
+        # --- اولویت ۲: مدیریت تمام ورودی‌های عددی ---
+        elif waiting_for in ["copy_DailyDrawdownPercent", "copy_AlertDrawdownPercent", "source_FixedVolume", "source_Multiplier"]:
             try:
                 value = float(text)
             except ValueError:
                 await update.message.reply_text("❌ خطا: ورودی باید یک عدد باشد. مثال: 4.7 یا 0.1")
-                return # منتظر ورودی صحیح بعدی می‌مانیم
+                return  # منتظر ورودی صحیح بعدی می‌مانیم
 
             if waiting_for.startswith("copy_"):
                 key = waiting_for.replace("copy_", "")
@@ -714,46 +779,21 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     await update.message.reply_text(f"✅ تنظیمات حجم برای `{source_id}` ذخیره شد.")
                 else:
                     raise IOError("خطا در ذخیره سازی یا بازسازی فایل کانفیگ سورس.")
-
-        # --- بخش مدیریت لیست نمادها ---
-        elif waiting_for == "symbols":
-            copy_id = context.user_data.get('selected_copy_id')
-            source_id = context.user_data.get('selected_source_id')
-            if not copy_id or not source_id:
-                raise KeyError("اطلاعات حساب کپی یا سورس در حافظه موقت یافت نشد.")
-
-            symbols = [sym.strip().upper() for sym in text.split(';') if sym.strip()]
-            allowed_symbols_str = ';'.join(symbols)
-
-            conn = next((c for c in ecosystem.get('mapping', {}).get(copy_id, []) if c['source_id'] == source_id), None)
-            if not conn:
-                raise KeyError(f"اتصال بین {copy_id} و {source_id} یافت نشد.")
-            
-            conn['allowed_symbols'] = allowed_symbols_str
-            if save_ecosystem(context) and await regenerate_copy_config(copy_id, context):
-                await update.message.reply_text(f"✅ لیست نمادها برای اتصال `{source_id}` به `{copy_id}` با موفقیت ذخیره شد.")
-            else:
-                raise IOError("خطا در ذخیره سازی یا بازسازی فایل کانفیگ اتصالات.")
         
         else:
             # اگر ربات منتظر ورودی ناشناخته‌ای بود
             logger.warning(f"Unknown 'waiting_for' state: {waiting_for}")
             should_return_to_main_menu = False
 
-
     except KeyError as e:
         await update.message.reply_text(f"❌ خطای منطقی: {e}. لطفاً دوباره از منوی اصلی شروع کنید.")
         logger.error(f"KeyError in handle_text_input: {e}", exc_info=True)
-        should_return_to_main_menu = True
     except IOError as e:
         await update.message.reply_text(f"❌ خطای فایل: {e}. لطفاً لاگ‌های سرور را بررسی کنید.")
         logger.error(f"IOError in handle_text_input: {e}", exc_info=True)
-        should_return_to_main_menu = True
     except Exception as e:
         await update.message.reply_text(f"❌ یک خطای پیش‌بینی نشده رخ داد: {e}")
         logger.error(f"Unhandled exception in handle_text_input: {e}", exc_info=True)
-        should_return_to_main_menu = True
-
     finally:
         # در هر صورت، چه موفقیت‌آمیز چه ناموفق، وضعیت را پاک کرده و به منوی اصلی بازگرد
         if should_return_to_main_menu:
@@ -826,7 +866,7 @@ def main() -> None:
     # Handlers for specific logic sections
     application.add_handler(CallbackQueryHandler(_handle_connections_menu, pattern="^menu_connections$|^conn:"))
     application.add_handler(CallbackQueryHandler(_handle_copy_settings_menu, pattern="^menu_copy_settings$|^setting:"))
-    application.add_handler(CallbackQueryHandler(_handle_volume_menu, pattern="^menu_volume_settings$|^vol:"))
+    application.add_handler(CallbackQueryHandler(_handle_sources_menu, pattern="^sources:"))
 
     # Handlers for text input state
     application.add_handler(CallbackQueryHandler(text_input_trigger, pattern="^setting_input_|^vol_input_"))

@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
+import json
 
 # --- Basic Configuration ---
 logging.basicConfig(
@@ -25,49 +26,126 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 LOG_DIRECTORY_PATH = os.getenv("LOG_DIRECTORY_PATH")
+CHANNEL_ID = os.getenv("CHANNEL_ID") # << خط جدید
+ECOSYSTEM_PATH = os.getenv("ECOSYSTEM_PATH") # << خط جدید
+
+source_name_map = {}
+
+def load_source_names():
+    """Loads the file_path -> name mapping from ecosystem.json."""
+    global source_name_map
+    if not ECOSYSTEM_PATH:
+        logger.warning("ECOSYSTEM_PATH not set. Cannot load source names.")
+        return
+    try:
+        with open(ECOSYSTEM_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        temp_map = {}
+        for source in data.get('sources', []):
+            if 'file_path' in source and 'name' in source:
+                temp_map[source['file_path']] = source['name']
+        
+        source_name_map = temp_map
+        logger.info(f"Successfully loaded {len(source_name_map)} source names.")
+    except Exception as e:
+        logger.error(f"Failed to load or parse ecosystem.json for source names: {e}")
 
 # --- Telegram Bot Function ---
 async def send_telegram_alert(bot: Bot, message: str):
-    """Sends a formatted message to the admin."""
-    if not ADMIN_ID:
-        logger.warning("ADMIN_ID not set. Cannot send alert.")
+    """Sends a formatted message, prioritizing Channel and falling back to Admin."""
+    target_id = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
+    if not target_id:
+        logger.warning("Neither CHANNEL_ID nor ADMIN_ID are set. Cannot send alert.")
         return
+
     try:
         await bot.send_message(
-            chat_id=ADMIN_ID,
+            chat_id=target_id,
             text=message,
             parse_mode=ParseMode.MARKDOWN
         )
-        logger.info(f"Alert sent to ADMIN_ID {ADMIN_ID}.")
+        logger.info(f"Alert sent to target_id {target_id}.")
     except TelegramError as e:
-        logger.error(f"Failed to send alert to Telegram: {e}")
+        logger.error(f"Failed to send alert to primary target {target_id}: {e}")
+        # Fallback to ADMIN_ID if the primary target was the channel and it failed
+        if target_id == CHANNEL_ID and ADMIN_ID:
+            logger.info(f"Falling back to sending alert to ADMIN_ID {ADMIN_ID}.")
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"⚠️ *ارسال به کانال ناموفق بود.*\n\n{message}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except TelegramError as e2:
+                logger.error(f"Failed to send fallback alert to ADMIN_ID: {e2}")
 
 # --- Log Parsing Logic (نسخه جدید با Source/Copy) ---
 def parse_and_format_log_line(line: str) -> str | None:
+    """Parses the new rich log formats and creates formatted messages."""
     line = line.strip()
-    if "[TRADE_OPEN]" in line:
-        try:
+
+    try:
+        if "[TRADE_OPEN]" in line:
             parts = line.split("]")[1].strip().split(',')
-            return (f"✅ *پوزیشن جدید باز شد*\n\n*حساب کپی:* `{parts[0]}`\n*نماد:* `{parts[1]}`\n*حجم:* `{parts[2]}`\n*قیمت باز شدن:* `{parts[3]}`\n*تیکت سورس:* `{parts[4]}`")
-        except IndexError: return f"⚠️ *خطا در تجزیه لاگ باز شدن پوزیشن*\n`{line}`"
-    elif "[TRADE_CLOSE]" in line:
-        try:
+            copy_id, symbol, volume, price, source_ticket, source_file = parts
+            source_name = source_name_map.get(source_file, source_file) # Fallback to file name
+            return (
+                f"✅ *پوزیشن جدید باز شد*\n\n"
+                f"*سورس:* `{source_name}`\n"
+                f"*حساب کپی:* `{copy_id}`\n"
+                f"*نماد:* `{symbol}`\n"
+                f"*حجم:* `{volume}`\n"
+                f"*قیمت باز شدن:* `{price}`\n"
+                f"*تیکت سورس:* `{source_ticket}`"
+            )
+
+        elif "[TRADE_CLOSE]" in line:
             parts = line.split("]")[1].strip().split(',')
-            return (f"☑️ *پوزیشن بسته شد*\n\n*حساب کپی:* `{parts[0]}`\n*نماد:* `{parts[1]}`\n*تیکت سورس:* `{parts[2]}`")
-        except IndexError: return f"⚠️ *خطا در تجزیه لاگ بسته شدن پوزیشن*\n`{line}`"
-    elif "[DD_ALERT]" in line:
-        try:
+            copy_id, symbol, source_ticket, profit_str = parts
+            profit = float(profit_str)
+            profit_text = f"+${profit:,.2f}" if profit >= 0 else f"-${abs(profit):,.2f}"
+            emoji = "☑️" if profit >= 0 else "🔻"
+            
+            # فرض می‌کنیم نام سورس در حافظه موقت موجود است (این بخش در آینده می‌تواند بهبود یابد)
+            # در حال حاضر چون نام سورس در لاگ بسته شدن نیست، آن را نمایش نمی‌دهیم
+            return (
+                f"{emoji} *پوزیشن بسته شد*\n\n"
+                f"*حساب کپی:* `{copy_id}`\n"
+                f"*نماد:* `{symbol}`\n"
+                f"*سود/ضرر:* `{profit_text}`\n"
+                f"*تیکت سورس:* `{source_ticket}`"
+            )
+
+        elif "[DD_ALERT]" in line:
             parts = line.split("]")[1].strip().split(',')
-            return (f"🟡 *هشدار حد ضرر روزانه*\n\n*حساب:* `{parts[0]}`\n*میزان ضرر فعلی:* `%{parts[1]}`")
-        except IndexError: return f"⚠️ *خطا در تجزیه لاگ هشدار DD*\n`{line}`"
-    elif "[DD_STOP]" in line:
-        try:
+            copy_id, dd, dollar_loss, start_equity, peak_equity = parts
+            return (
+                f"🟡 *هشدار حد ضرر روزانه*\n\n"
+                f"*حساب:* `{copy_id}`\n"
+                f"*میزان ضرر فعلی:* `%{float(dd):.2f}` `(-${float(dollar_loss):,.2f})`\n"
+                f"*موجودی اولیه روز:* `${float(start_equity):,.2f}`\n"
+                f"*حداکثر موجودی روز:* `${float(peak_equity):,.2f}`"
+            )
+
+        elif "[DD_STOP]" in line:
             parts = line.split("]")[1].strip().split(',')
-            return (f"🔴 *توقف کپی به دلیل حد ضرر*\n\n*حساب:* `{parts[0]}`\n*ضرر در لحظه توقف:* `%{parts[1]}`\n*آستانه توقف:* `%{parts[2]}`")
-        except IndexError: return f"⚠️ *خطا در تجزیه لاگ توقف DD*\n`{line}`"
-    elif "[ERROR]" in line:
-        error_message = line.split("[ERROR] -")[1].strip()
-        return (f"🚨 *خطای اکسپرت*\n\n`{error_message}`")
+            copy_id, dd, dd_limit, dollar_loss, start_equity, peak_equity = parts
+            return (
+                f"🔴 *توقف کپی به دلیل حد ضرر*\n\n"
+                f"*حساب:* `{copy_id}`\n"
+                f"*ضرر در لحظه توقف:* `%{float(dd):.2f}` `(-${float(dollar_loss):,.2f})`\n"
+                f"*آستانه توقف:* `%{float(dd_limit):.2f}`"
+            )
+
+        elif "[ERROR]" in line:
+            error_message = line.split("[ERROR] -")[1].strip()
+            return f"🚨 *خطای اکسپرت*\n\n`{error_message}`"
+
+    except (IndexError, ValueError) as e:
+        logger.error(f"Error parsing log line: '{line}'. Error: {e}")
+        return f"⚠️ *خطا در تجزیه لاگ*\n`{line}`"
+        
     return None
 
 # --- File Monitoring Logic (بدون تغییر) ---
@@ -106,6 +184,9 @@ async def main():
 
     while True:
         try:
+            # فراخوانی تابع برای به‌روزرسانی نام‌ها
+            load_source_names() 
+            
             # ۱. یافتن تمام فایل‌های لاگ موجود
             log_pattern = os.path.join(LOG_DIRECTORY_PATH, "TradeCopier_*.log")
             all_files = glob(log_pattern)
