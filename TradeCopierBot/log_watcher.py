@@ -114,9 +114,10 @@ async def send_telegram_alert(bot: Bot, message: str):
                 logger.info(f"Fallback alert sent to ADMIN_ID.")
             except TelegramError as e2:
                 logger.error(f"Failed fallback to ADMIN_ID: {e2}")
-
-# --- Robust Log Parsing (with Regex, State, and Backward Compat) ---
 def parse_and_format_log_line(line: str, state: dict) -> str | None:
+    """Parses and formats a log line, updating the state if necessary."""
+    global state_changed  # <<-- این خط به اینجا منتقل شد
+
     line = line.strip()
     if not line:
         return None
@@ -135,10 +136,12 @@ def parse_and_format_log_line(line: str, state: dict) -> str | None:
                 raise ValueError(f"Invalid OPEN format: expected 6 parts, got {len(parts)}")
             copy_id, symbol, volume, price, source_ticket, source_file = [p.strip() for p in parts]
             source_name = source_name_map.get(source_file, source_file)
+            
             # Update state
-            state[source_ticket] = source_name
-            global state_changed
-            state_changed = True
+            if state.get(source_ticket) != source_name:
+                state[source_ticket] = source_name
+                state_changed = True
+                
             return (
                 f"✅ *New Position Opened*\n\n"
                 f"*Source:* `{source_name}`\n"
@@ -159,17 +162,19 @@ def parse_and_format_log_line(line: str, state: dict) -> str | None:
                 source_name = state.get(source_ticket, 'Unknown Source')
             else:
                 raise ValueError(f"Invalid CLOSE format: expected 4 or 5 parts, got {len(parts)}")
+            
             profit = float(profit_str)
             profit_text = f"+${profit:,.2f}" if profit >= 0 else f"-${abs(profit):,.2f}"
             emoji = "☑️" if profit >= 0 else "🔻"
+            
             # Remove from state
             if source_ticket in state:
                 del state[source_ticket]
-                global state_changed
                 state_changed = True
+                
             return (
                 f"{emoji} *Position Closed*\n\n"
-                f"*Source:* `{source_name}`\n"  # Now always available
+                f"*Source:* `{source_name}`\n"
                 f"*Copy Account:* `{copy_id}`\n"
                 f"*Symbol:* `{symbol}`\n"
                 f"*Profit/Loss:* `{profit_text}`\n"
@@ -198,7 +203,7 @@ def parse_and_format_log_line(line: str, state: dict) -> str | None:
                 f"🔴 *Copy Stopped Due to DD Limit*\n\n"
                 f"*Account:* `{copy_id}`\n"
                 f"*Loss at Stop:* `%{float(dd):.2f}` `(-${float(dollar_loss):,.2f})`\n"
-                f"*Stop Threshold:* `%{float(dd_limit):.2f}`"
+                f"*Stop Threshold:* `%{float(dd_limit):,.2f}`"
             )
 
         elif match := error_pattern.search(line):
@@ -210,7 +215,6 @@ def parse_and_format_log_line(line: str, state: dict) -> str | None:
         return f"⚠️ *Parse Error in Log*\n`{line}`"
 
     return None
-
 # --- File Monitoring (with better error handling) ---
 async def follow_log_file(bot: Bot, filepath: str, state: dict):
     logger.info(f"Starting watch on log: {filepath}", extra={'task_name': asyncio.current_task().get_name()})
