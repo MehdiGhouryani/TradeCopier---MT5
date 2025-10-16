@@ -2,115 +2,41 @@
   "sources": [
     {
       "id": "source_1",
-      "name": "سورس 1",
+      "name": "یعقوب",
       "file_path": "TradeCopier_S1.txt",
-      "config_file": "source_1_config.txt",
-      "volume_settings": {
-        "FixedVolume": 0.1
-      }
+      "config_file": "source_1_config.txt"
     },
     {
       "id": "source_2",
-      "name": "سورس 2",
+      "name": "رضا",
       "file_path": "TradeCopier_S2.txt",
-      "config_file": "source_2_config.txt",
-      "volume_settings": {
-        "Multiplier": 3.0
-      }
-    },
-    {
-      "id": "source_3",
-      "name": " سورس 3",
-      "file_path": "TradeCopier_S3.txt",
-      "config_file": "source_3_config.txt",
-      "volume_settings": {
-        "FixedVolume": 0.1
-      }
-    },
-    {
-      "id": "source_4",
-      "name": "سورس 4",
-      "file_path": "TradeCopier_S4.txt",
-      "config_file": "source_4_config.txt",
-      "volume_settings": {
-        "FixedVolume": 0.1
-      }
-    },
-    {
-      "id": "source_5",
-      "name": "سورس 5",
-      "file_path": "TradeCopier_S5.txt",
-      "config_file": "source_5_config.txt",
-      "volume_settings": {
-        "FixedVolume": 0.1
-      }
+      "config_file": "source_2_config.txt"
     }
   ],
   "copies": [
     {
-      "id": "copy_A",
+      "id": "copy_1",
       "name": "کپی 1",
-      "settings": {
-        "DailyDrawdownPercent": 4.5,
-        "AlertDrawdownPercent": 4.0,
-        "CopySymbolMode": "GOLD_ONLY"
-      }
-    },
-    {
-      "id": "copy_B",
-      "name": "کپی 2",
-      "settings": {
-        "DailyDrawdownPercent": 3.0,
-        "AlertDrawdownPercent": 2.5,
-        "CopySymbolMode": "ALL"
-      }
+      "settings": {}
     }
   ],
   "mapping": {
-    "copy_A": [
+    "copy_1": [
       {
         "source_id": "source_1",
-        "mode": "GOLD_ONLY"
+        "mode": "ALL",
+        "allowed_symbols": "",
+        "volume_settings": {
+          "Multiplier": 2.0
+        }
       },
       {
         "source_id": "source_2",
-        "mode": "SYMBOLS",
-        "allowed_symbols": "AUDUSD;AUDJPY"
-      },
-      {
-        "source_id": "source_3",
-        "mode": "GOLD_ONLY"
-      },
-      {
-        "source_id": "source_4",
-        "mode": "GOLD_ONLY"
-      },
-      {
-        "source_id": "source_5",
-        "mode": "GOLD_ONLY"
-      }
-    ],
-    "copy_B": [
-      {
-        "source_id": "source_1",
-        "mode": "GOLD_ONLY"
-      },
-      {
-        "source_id": "source_2",
-        "mode": "SYMBOLS",
-        "allowed_symbols": "AUDUSD;AUDJPY"
-      },
-      {
-        "source_id": "source_3",
-        "mode": "GOLD_ONLY"
-      },
-      {
-        "source_id": "source_4",
-        "mode": "GOLD_ONLY"
-      },
-      {
-        "source_id": "source_5",
-        "mode": "GOLD_ONLY"
+        "mode": "ALL",
+        "allowed_symbols": "",
+        "volume_settings": {
+          "FixedVolume": 0.1
+        }
       }
     ]
   }

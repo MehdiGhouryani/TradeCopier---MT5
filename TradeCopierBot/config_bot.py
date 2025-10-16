@@ -196,43 +196,68 @@ async def regenerate_all_configs(context: ContextTypes.DEFAULT_TYPE) -> bool:
     logger.info("All configs regenerated", extra={'status': 'success' if all_success else 'failure'})
     return all_success
 
+
+
+
 async def regenerate_copy_config(copy_id: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Regenerate source configuration file for a copy account."""
+    """
+    Regenerates the source configuration file (.cfg) for a specific copy account.
+    This final version robustly ensures the correct 5-column format to prevent parsing errors in the EA.
+    """
+    log_extra = {'entity_id': copy_id, 'status': 'starting'}
+    logger.debug("Starting regeneration of copy config.", extra=log_extra)
+    
     ecosystem = context.bot_data.get('ecosystem', {})
     connections = ecosystem.get('mapping', {}).get(copy_id, [])
     all_sources = {source['id']: source for source in ecosystem.get('sources', [])}
+    
     content = ["# file_path,mode,allowed_symbols,volume_type,volume_value"]
+    
     for conn in connections:
         source_id = conn.get('source_id')
         if source_id in all_sources:
             source_info = all_sources[source_id]
-            mode = conn.get('mode', 'ALL')
+            
+            mode = conn.get('mode', 'ALL').upper()
+            
+            # اگر حالت SYMBOLS نبود، این فیلد باید خالی باشد اما همچنان وجود داشته باشد.
+            # این بخش کلیدی برای حل مشکل است.
             allowed_symbols = conn.get('allowed_symbols', '') if mode == 'SYMBOLS' else ''
+            
             volume_settings = conn.get('volume_settings', {})
-            volume_type = "MULTIPLIER"
-            volume_value = 1.0
+            
             if "FixedVolume" in volume_settings:
                 volume_type = "FIXED"
                 volume_value = volume_settings["FixedVolume"]
-            elif "Multiplier" in volume_settings:
+            else:
                 volume_type = "MULTIPLIER"
-                volume_value = volume_settings["Multiplier"]
+                volume_value = volume_settings.get("Multiplier", 1.0)
+            
+            # ساختن خط با فرمت دقیق و صحیح 
+            # تمام ۵ متغیر در f-string پاس داده می‌شوند تا فرمت همیشه درست باشد.
             line = f"{source_info['file_path']},{mode},{allowed_symbols},{volume_type},{volume_value}"
             content.append(line)
+        else:
+            logger.warning(f"Source ID '{source_id}' in mapping not in sources list. Skipping.", extra=log_extra)
+            
     cfg_path = os.path.join(os.path.dirname(ECOSYSTEM_PATH), f"{copy_id}_sources.cfg")
     tmp_path = cfg_path + ".tmp"
+    
     try:
         with open(tmp_path, 'w', encoding='utf-8') as f:
             f.write("\n".join(content))
         os.replace(tmp_path, cfg_path)
-        logger.info("Copy config regenerated", extra={'entity_id': copy_id, 'status': 'success'})
+        log_extra['status'] = 'success'
+        logger.info("Successfully regenerated copy config file with correct format.", extra=log_extra)
         return True
     except Exception as e:
-        logger.error("Copy config regeneration failed", extra={'entity_id': copy_id, 'status': 'failure', 'error': str(e)})
+        log_extra.update({'status': 'failure', 'error': str(e)})
+        logger.error("Failed during copy config regeneration.", extra=log_extra)
         await notify_admin_on_error(context, "regenerate_copy_config", e, copy_id=copy_id)
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         return False
+
 
 async def regenerate_copy_settings_config(copy_id: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Regenerate settings configuration file for a copy account."""
@@ -567,18 +592,15 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 
-
-
 async def _display_connections_for_copy(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, copy_id: str):
     """
     Helper function to display the connections menu for a specific copy account.
-    This version uses a cleaner, shorter, and correctly formatted button layout.
+    This version is enhanced to show both the name and ID of sources for better clarity.
     """
     ecosystem = context.bot_data.get('ecosystem', {})
     source_map = {s['id']: s for s in ecosystem.get('sources', [])}
-    copy_map = {c['id']: c for c in ecosystem.get('copies', [])}
+    copy_account = next((c for c in ecosystem.get('copies', []) if c['id'] == copy_id), None)
     
-    copy_account = copy_map.get(copy_id)
     if not copy_account:
         await query.edit_message_text("❌ حساب کپی مورد نظر یافت نشد\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
@@ -587,44 +609,67 @@ async def _display_connections_for_copy(query: CallbackQuery, context: ContextTy
     connected_source_ids = {conn['source_id'] for conn in connections}
     
     keyboard = []
-    # نمایش اتصالات موجود
-    for conn in connections:
-        source_id = conn['source_id']
-        if source_id in source_map:
+    
+    # --- نمایش اتصالات موجود ---
+    if not connections:
+        keyboard.append([InlineKeyboardButton("این حساب به هیچ منبعی متصل نیست", callback_data="noop")])
+    else:
+        for conn in connections:
+            source_id = conn.get('source_id')
+            if source_id not in source_map:
+                continue
+
+            source_name = escape_markdown_v2(source_map[source_id]['name'])
+            source_id_escaped = escape_markdown_v2(source_id)
+            
+            # تیتر خوانا برای هر اتصال
+            header_text = f"───  اتصال به: {source_name} ({source_id_escaped}) ───"
+            keyboard.append([InlineKeyboardButton(header_text, callback_data="noop")])
+
+            # دکمه تنظیمات حجم
             vs = conn.get('volume_settings', {})
-            mode = "Fixed" if "FixedVolume" in vs else "Multiplier"
-            value = vs.get("FixedVolume", vs.get("Multiplier", "1.0"))
-            
-            # ✅ اصلاحیه اصلی: فرمت جدید، کوتاه‌تر، بدون اموجی و با نقطه اعشار صحیح
-            volume_text = f"{mode}: {value}"
-            disconnect_text = f"✂️ قطع {escape_markdown_v2(source_map[source_id]['name'])}"
-            
+            vol_mode = "Fixed" if "FixedVolume" in vs else "Multiplier"
+            vol_value = vs.get("FixedVolume", vs.get("Multiplier", 1.0))
+            volume_text = f"⚙️ حجم: {vol_mode} {vol_value}"
+
+            # دکمه حالت کپی
+            copy_mode = conn.get('mode', 'ALL')
+            mode_text = "🚦 حالت: "
+            if copy_mode == 'ALL':
+                mode_text += "همه نمادها"
+            elif copy_mode == 'GOLD_ONLY':
+                mode_text += "فقط طلا"
+            elif copy_mode == 'SYMBOLS':
+                symbols = conn.get('allowed_symbols', '')
+                short_symbols = symbols[:10] + '...' if len(symbols) > 10 else symbols
+                mode_text += f"خاص ({escape_markdown_v2(short_symbols) or 'خالی'})"
+
             keyboard.append([
                 InlineKeyboardButton(volume_text, callback_data=f"conn:set_volume_type:{copy_id}:{source_id}"),
-                InlineKeyboardButton(disconnect_text, callback_data=f"conn:disconnect:{copy_id}:{source_id}")
+                InlineKeyboardButton(mode_text, callback_data=f"conn:set_mode_menu:{copy_id}:{source_id}"),
+                InlineKeyboardButton("✂️ قطع", callback_data=f"conn:disconnect:{copy_id}:{source_id}")
             ])
 
-    # نمایش منابع قابل اتصال
+    # --- نمایش منابع قابل اتصال ---
     available_sources = [s for s_id, s in source_map.items() if s_id not in connected_source_ids]
     if available_sources:
-        keyboard.append([InlineKeyboardButton("──────────", callback_data="noop")])
+        keyboard.append([InlineKeyboardButton("─" * 20, callback_data="noop")])
+        keyboard.append([InlineKeyboardButton("🔽 اتصال به یک منبع جدید 🔽", callback_data="noop")])
         for source in available_sources:
-            connect_text = f"🔗 اتصال {escape_markdown_v2(source['name'])}"
+            # نمایش نام و شناسه برای منابع جدید
+            connect_text = f"🔗 {escape_markdown_v2(source['name'])} ({escape_markdown_v2(source['id'])})"
             keyboard.append([InlineKeyboardButton(connect_text, callback_data=f"conn:connect:{copy_id}:{source['id']}")])
 
     keyboard.append([InlineKeyboardButton("🔙 بازگشت به لیست حساب‌ها", callback_data="menu_connections")])
     
     try:
         await query.edit_message_text(
-            f"اتصالات حساب *{escape_markdown_v2(copy_account['name'])}*:",
+            f"مدیریت اتصالات حساب *{escape_markdown_v2(copy_account['name'])}*:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN_V2
         )
     except BadRequest as e:
-        if "Message is not modified" in str(e):
-            logger.debug("Skipping connections menu refresh: content is identical.", extra={'copy_id': copy_id})
-            pass
-        else:
+        if "Message is not modified" not in str(e):
             raise
 
 
@@ -633,20 +678,19 @@ async def _display_connections_for_copy(query: CallbackQuery, context: ContextTy
 @allowed_users_only
 async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handles the main connections menu, including connect and disconnect actions.
-    The logic for setting volume types is now delegated to another handler.
+    Handles the main connections menu, including connect, disconnect, and mode selection actions.
     """
     query = update.callback_query
     await query.answer()
     data = query.data
     parts = data.split(':')
     ecosystem = context.bot_data.get('ecosystem', {})
-    action = parts[0]
     user_id = update.effective_user.id
-    log_extra = {'user_id': user_id, 'callback_data': data}
+    log_extra = {'user_id': user_id, 'callback_data': data, 'status': 'processing'}
 
     try:
-        if action == "menu_connections":
+        # --- نمایش منوی اصلی اتصالات ---
+        if data == "menu_connections":
             context.user_data.clear()
             logger.debug("Navigating to main connections menu", extra=log_extra)
             keyboard = []
@@ -658,23 +702,26 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
             await query.edit_message_text("مدیریت اتصالات: یک حساب کپی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
             return
 
-        if action == "conn" and parts[1] == "select_copy":
+        # --- نمایش منوی یک حساب کپی خاص ---
+        if parts[1] == "select_copy":
             copy_id = parts[2]
             context.user_data['selected_copy_id'] = copy_id
             await _display_connections_for_copy(query, context, copy_id)
             return
 
-        if action == "conn" and (parts[1] == "connect" or parts[1] == "disconnect"):
+        # --- مدیریت اتصال و قطع اتصال ---
+        if parts[1] in ["connect", "disconnect"]:
             copy_id, source_id = parts[2], parts[3]
             log_extra.update({'copy_id': copy_id, 'source_id': source_id})
             
             if parts[1] == "connect":
                 logger.info("Connection process initiated", extra=log_extra)
+                # هنگام اتصال، یک کانفیگ پیش‌فرض با حالت ALL ایجاد می‌کنیم
                 ecosystem.setdefault('mapping', {}).setdefault(copy_id, []).append({
                     'source_id': source_id, 'mode': 'ALL', 'allowed_symbols': '', 'volume_settings': {"Multiplier": 1.0}
                 })
                 feedback_text = "✅ اتصال با موفقیت برقرار شد"
-            else: # disconnect
+            else:  # disconnect
                 logger.info("Disconnection process initiated", extra=log_extra)
                 ecosystem['mapping'][copy_id] = [c for c in ecosystem['mapping'].get(copy_id, []) if c['source_id'] != source_id]
                 feedback_text = "✅ اتصال با موفقیت قطع شد"
@@ -682,18 +729,74 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
             if save_ecosystem(context):
                 await regenerate_copy_config(copy_id, context)
                 await query.answer(text=feedback_text)
-                logger.info("Connection state changed and config regenerated successfully.", extra=log_extra)
+                log_extra['status'] = 'success'
+                logger.info("Connection state changed and config regenerated.", extra=log_extra)
                 await _display_connections_for_copy(query, context, copy_id)
             else:
+                log_extra['status'] = 'failure'
                 logger.error("Failed to save ecosystem during connection/disconnection", extra=log_extra)
                 await query.answer("❌ خطا در ذخیره‌سازی تغییرات!")
             return
 
+        # --- نمایش منوی انتخاب حالت کپی (بخش جدید) ---
+        if parts[1] == "set_mode_menu":
+            copy_id, source_id = parts[2], parts[3]
+            log_extra.update({'copy_id': copy_id, 'source_id': source_id})
+            logger.debug("Displaying copy mode selection menu", extra=log_extra)
+            
+            keyboard = [
+                [InlineKeyboardButton("1️⃣ همه نمادها (All Symbols)", callback_data=f"conn:set_mode_action:ALL:{copy_id}:{source_id}")],
+                [InlineKeyboardButton("2️⃣ فقط طلا (Gold Only)", callback_data=f"conn:set_mode_action:GOLD_ONLY:{copy_id}:{source_id}")],
+                [InlineKeyboardButton("3️⃣ نمادهای خاص (Specific Symbols)", callback_data=f"conn:set_mode_action:SYMBOLS:{copy_id}:{source_id}")],
+                [InlineKeyboardButton("🔙 لغو", callback_data=f"conn:select_copy:{copy_id}")]
+            ]
+            await query.edit_message_text(
+                "لطفاً حالت کپی برای این اتصال را انتخاب کنید:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            return
+
+        # --- پردازش انتخاب حالت کپی (بخش جدید) ---
+        if parts[1] == "set_mode_action":
+            mode, copy_id, source_id = parts[2], parts[3], parts[4]
+            log_extra.update({'copy_id': copy_id, 'source_id': source_id, 'details': {'new_mode': mode}})
+
+            connection = next((conn for conn in ecosystem.get('mapping', {}).get(copy_id, []) if conn['source_id'] == source_id), None)
+            if not connection:
+                await query.answer("❌ خطا: اتصال یافت نشد!", show_alert=True)
+                return
+
+            if mode == "SYMBOLS":
+                context.user_data['waiting_for'] = f"conn_symbols:{copy_id}:{source_id}"
+                log_extra['state_set'] = context.user_data['waiting_for']
+                logger.debug("Prompting user for allowed symbols list", extra=log_extra)
+                await query.edit_message_text(
+                    "لطفاً لیست نمادهای مجاز را وارد کنید\\. نمادها را با سمی‌کالن (;) از هم جدا کنید\\.\nمثال: `EURUSD;GBPUSD;XAUUSD`",
+                    parse_mode=ParseMode.MARKDOWN_V2
+                )
+                return
+
+            # برای ALL و GOLD_ONLY مستقیماً ذخیره می‌کنیم
+            connection['mode'] = mode
+            if save_ecosystem(context):
+                await regenerate_copy_config(copy_id, context)
+                await query.answer(f"✅ حالت کپی به '{mode}' تغییر کرد.")
+                log_extra['status'] = 'success'
+                logger.info("Connection copy mode updated.", extra=log_extra)
+                await _display_connections_for_copy(query, context, copy_id)
+            else:
+                log_extra['status'] = 'failure'
+                logger.error("Failed to save ecosystem after changing copy mode", extra=log_extra)
+                await query.answer("❌ خطا در ذخیره‌سازی تغییرات!")
+            return
+
     except Exception as e:
-        log_extra['error'] = str(e)
-        logger.error("An unexpected error occurred in the connections menu handler.", extra=log_extra)
-        # Using edit_message_text to provide a clear error message in the chat
-        await query.edit_message_text("❌ یک خطای غیرمنتظره در منوی اتصالات رخ داد\\. لطفا لاگ‌ها را بررسی کنید\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        log_extra.update({'error': str(e), 'status': 'failure'})
+        logger.critical("An unexpected exception occurred in the connections menu handler.", extra=log_extra)
+        await notify_admin_on_error(context, "_handle_connections_menu", e, callback_data=data)
+        await query.message.reply_text("❌ یک خطای غیرمنتظره رخ داد\\. گزارش برای ادمین ارسال شد\\.", parse_mode=ParseMode.MARKDOWN_V2)
+
 
 
 
@@ -749,7 +852,6 @@ async def _display_copy_account_menu(query: CallbackQuery, context: ContextTypes
             logger.error("A BadRequest occurred while editing message", extra={'error': str(e)})
             raise
 
-
 @allowed_users_only
 async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle copy account settings menu with improved logic, UX, and logging."""
@@ -760,10 +862,12 @@ async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAU
     parts = data.split(':')
     action = parts[0]
     user_id = update.effective_user.id
+    log_extra = {'user_id': user_id, 'callback_data': data, 'status': 'processing'}
 
+    # --- نمایش منوی اصلی حساب‌های کپی ---
     if action == "menu_copy_settings":
         context.user_data.clear()
-        logger.debug("State cleared for copy settings menu", extra={'user_id': user_id})
+        logger.debug("State cleared for copy settings menu", extra=log_extra)
         copies = ecosystem.get('copies', [])
         keyboard = []
         for c in copies:
@@ -773,12 +877,14 @@ async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text("مدیریت حساب‌های کپی: یک حساب را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
         return
 
+    # --- نمایش منوی تنظیمات یک حساب خاص ---
     if action == "setting" and parts[1] == "select":
         copy_id = parts[2]
         context.user_data['selected_copy_id'] = copy_id
         await _display_copy_account_menu(query, context, copy_id)
         return
 
+    # --- مدیریت اقدامات روی یک حساب (تغییر تنظیمات) ---
     if action == "setting" and parts[1] == "action":
         sub_action = parts[2]
         copy_id = parts[3]
@@ -795,19 +901,19 @@ async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAU
             new_dd = 0 if old_dd > 0 else 5.0
             settings["DailyDrawdownPercent"] = new_dd
             feedback_text = "ریسک روزانه غیرفعال شد." if new_dd == 0 else "ریسک روزانه فعال شد."
-            logger.info("Daily drawdown toggled", extra={'user_id': user_id, 'entity_id': copy_id, 'from': old_dd, 'to': new_dd})
+            logger.info("Daily drawdown toggled", extra={'user_id': user_id, 'entity_id': copy_id, 'details': {'from': old_dd, 'to': new_dd}})
 
         elif sub_action == "copy_mode":
             old_mode = settings.get("CopySymbolMode", "GOLD_ONLY")
             new_mode = "ALL_SYMBOLS" if old_mode == "GOLD_ONLY" else "GOLD_ONLY"
             settings["CopySymbolMode"] = new_mode
             feedback_text = f"حالت کپی به '{'همه نمادها' if new_mode == 'ALL_SYMBOLS' else 'فقط طلا'}' تغییر کرد."
-            logger.info("Copy symbol mode toggled", extra={'user_id': user_id, 'entity_id': copy_id, 'from': old_mode, 'to': new_mode})
+            logger.info("Copy symbol mode toggled", extra={'user_id': user_id, 'entity_id': copy_id, 'details': {'from': old_mode, 'to': new_mode}})
 
         elif sub_action == "reset_stop":
             context.user_data['reset_stop_for_copy'] = copy_id
             feedback_text = "دستور ریست در بازسازی بعدی اعمال می‌شود."
-            logger.info("ResetStop flag set", extra={'user_id': user_id, 'entity_id': copy_id})
+            logger.info("ResetStop flag set for next regeneration", extra={'user_id': user_id, 'entity_id': copy_id})
 
         if feedback_text:
             if save_ecosystem(context):
@@ -815,35 +921,39 @@ async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAU
                 await query.answer(feedback_text)
                 await _display_copy_account_menu(query, context, copy_id)
             else:
-                logger.error("Ecosystem save failed after action", extra={'user_id': user_id, 'entity_id': copy_id, 'action': sub_action})
+                log_extra.update({'status': 'failure', 'action': sub_action})
+                logger.error("Ecosystem save failed after action", extra=log_extra)
                 await query.answer("❌ خطا در ذخیره‌سازی تغییرات.")
         return
 
+    # --- منطق افزودن حساب جدید (بازنویسی شده) ---
     if action == "setting" and parts[1] == "add":
-        # ... این بخش بدون تغییر باقی می‌ماند ...
-        sub_action = parts[2]
-        if sub_action == "start":
+        if parts[2] == "start":
             context.user_data.clear()
-            logger.debug("State cleared: add copy account", extra={'user_id': user_id, 'status': 'info'})
-            copies = ecosystem.get('copies', [])
-            existing_ids = [c['id'] for c in copies]
-            max_num = 0
-            for cid in existing_ids:
-                if cid.startswith("copy_"):
-                    try:
-                        num = int(cid.replace("copy_", ""))
-                        max_num = max(max_num, num)
-                    except ValueError:
-                        continue
-            new_copy_id = f"copy_{max_num + 1}"
+            
+            existing_ids = {c['id'] for c in ecosystem.get('copies', [])}
+            possible_ids = [f"copy_{chr(ord('A') + i)}" for i in range(10)] # Creates copy_A to copy_J
+            
+            new_copy_id = None
+            for pid in possible_ids:
+                if pid not in existing_ids:
+                    new_copy_id = pid
+                    break
+            
+            if new_copy_id is None:
+                await query.edit_message_text("❌ تمام ظرفیت حساب‌های کپی (A-J) پر شده است\\.", parse_mode=ParseMode.MARKDOWN_V2)
+                return
+
             context.user_data['temp_copy_id'] = new_copy_id
             context.user_data['waiting_for'] = 'copy_add_name'
-            logger.debug("State changed: waiting for copy name", extra={'user_id': user_id, 'input_for': 'copy_add_name', 'entity_id': new_copy_id})
-            await query.edit_message_text(f"شناسه جدید: *{escape_markdown_v2(new_copy_id)}*\n\nنام نمایشی حساب جدید را وارد کنید:", parse_mode=ParseMode.MARKDOWN_V2)
+            log_extra['state_set'] = 'copy_add_name'
+            log_extra['details'] = {'new_id': new_copy_id}
+            logger.debug("Prompting user for new copy account name.", extra=log_extra)
+            await query.edit_message_text(f"شناسه جدید تخصیص داده شد: *{escape_markdown_v2(new_copy_id)}*\n\nلطفاً یک نام نمایشی برای این حساب وارد کنید:", parse_mode=ParseMode.MARKDOWN_V2)
         return
 
+    # --- منطق حذف حساب ---
     if action == "setting" and parts[1] == "delete":
-        # ... این بخش با اصلاحات قبلی باقی می‌ماند ...
         sub_action = parts[2]
         copy_id = parts[3]
         if sub_action == "confirm":
@@ -852,18 +962,14 @@ async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAU
                 [InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"setting:delete:execute:{copy_id}")],
                 [InlineKeyboardButton("❌ خیر، بازگشت", callback_data=f"setting:select:{copy_id}")]
             ]
-            # ✅ اصلاحیه اینجاست: نقطه انتهای جمله escape شده است
             confirmation_text = f"آیا از حذف حساب *{escape_markdown_v2(copy_name)}* و تمام اتصالات آن مطمئن هستید؟ این عمل غیرقابل بازگشت است\\."
-            await query.edit_message_text(
-                confirmation_text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
+            await query.edit_message_text(confirmation_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
             return
 
         if sub_action == "execute":
-            logger.info("Copy deletion started", extra={'user_id': user_id, 'entity_id': copy_id})
-            backup_ecosystem()
+            log_extra['entity_id'] = copy_id
+            logger.info("Copy account deletion initiated", extra=log_extra)
+            
             copies = ecosystem.get('copies', [])
             copy_name = next((c['name'] for c in copies if c['id'] == copy_id), copy_id)
             ecosystem['copies'] = [c for c in copies if c['id'] != copy_id]
@@ -872,25 +978,16 @@ async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAU
 
             if save_ecosystem(context):
                 await regenerate_all_configs(context)
-                logger.info("Copy account deleted successfully", extra={'user_id': user_id, 'entity_id': copy_id})
+                log_extra['status'] = 'success'
+                logger.info("Copy account deleted successfully.", extra=log_extra)
                 
-                # ✅ اصلاحیه اصلی اینجاست
-                # یک دکمه "بازگشت" ایجاد می‌کنیم تا کاربر را به منوی اصلی هدایت کند
                 keyboard = [[InlineKeyboardButton("🔙 بازگشت به لیست حساب‌ها", callback_data="menu_copy_settings")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    text=f"✅ حساب *{escape_markdown_v2(copy_name)}* با موفقیت حذف شد\\.",
-                    reply_markup=reply_markup,
-                    parse_mode=ParseMode.MARKDOWN_V2
-                )
+                await query.edit_message_text(text=f"✅ حساب *{escape_markdown_v2(copy_name)}* با موفقیت حذف شد\\.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
             else:
-                logger.error("Copy deletion save failed", extra={'user_id': user_id, 'entity_id': copy_id})
-                await query.edit_message_text("❌ خطا در هنگام حذف حساب. لطفا لاگ‌ها را بررسی کنید.", parse_mode=ParseMode.MARKDOWN_V2)
-
+                log_extra['status'] = 'failure'
+                logger.error("Copy deletion save failed", extra=log_extra)
+                await query.edit_message_text("❌ خطا در هنگام حذف حساب\\. لطفا لاگ‌ها را بررسی کنید.", parse_mode=ParseMode.MARKDOWN_V2)
             return
-
-
 
 
 @allowed_users_only
@@ -993,17 +1090,22 @@ async def _handle_sources_menu(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.error("A BadRequest occurred in sources menu handler", extra=log_extra)
             raise
 
+
+
+
+
+
+
 # ==============================================================================
-#  TEXT INPUT HANDLER & PROCESSORS (REFACTORED WITH SMART-ADD)
+#  TEXT INPUT HANDLER & PROCESSORS (REFACTORED)
 # ==============================================================================
 
 async def _process_source_smart_add(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
     """Processes the display name to smartly create a new source."""
     if not text:
         await update.message.reply_text("❌ نام نمی‌تواند خالی باشد\\. لطفاً یک نام معتبر وارد کنید:", parse_mode=ParseMode.MARKDOWN_V2)
-        return False # State should not be cleared
+        return False
 
-    # هوشمندسازی: پیدا کردن بالاترین شماره ID موجود
     max_num = 0
     sources = ecosystem.get('sources', [])
     for s in sources:
@@ -1027,21 +1129,18 @@ async def _process_source_smart_add(update: Update, context: ContextTypes.DEFAUL
     if not save_ecosystem(context):
         raise IOError("Failed to save ecosystem after smart-adding source")
 
-    log_extra['entity_id'] = new_source['id']
-    log_extra['details'] = new_source
+    log_extra.update({'entity_id': new_source['id'], 'details': new_source})
     logger.info("New source smart-added successfully", extra=log_extra)
     
     success_message = (
         f"✅ منبع *{escape_markdown_v2(new_source['name'])}* با موفقیت ساخته شد\\.\n\n"
         f"▫️ شناسه: `{escape_markdown_v2(new_source['id'])}`\n"
-        f"▫️ فایل مسیر: `{escape_markdown_v2(new_source['file_path'])}`\n"
-        f"▫️ فایل تنظیمات: `{escape_markdown_v2(new_source['config_file'])}`"
+        f"▫️ فایل مسیر: `{escape_markdown_v2(new_source['file_path'])}`"
     )
     await update.message.reply_text(success_message, parse_mode=ParseMode.MARKDOWN_V2)
-    return True # Indicate success to clear state and return to main menu
+    return True
 
 async def _process_source_edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
-    # (این تابع بدون تغییر باقی می‌ماند)
     if not text:
         await update.message.reply_text("❌ نام نمی‌تواند خالی باشد\\. لطفاً یک نام معتبر وارد کنید:", parse_mode=ParseMode.MARKDOWN_V2)
         return False
@@ -1055,17 +1154,19 @@ async def _process_source_edit_name(update: Update, context: ContextTypes.DEFAUL
     old_name = source_to_edit['name']
     source_to_edit['name'] = text
     if not save_ecosystem(context):
-        source_to_edit['name'] = old_name
+        source_to_edit['name'] = old_name # Rollback change on failure
         raise IOError("Failed to save ecosystem after editing source name")
     log_extra.update({'entity_id': source_id, 'details': {'from': old_name, 'to': text}})
     logger.info("Source name updated successfully", extra=log_extra)
     await update.message.reply_text("✅ نام منبع با موفقیت تغییر کرد\\.", parse_mode=ParseMode.MARKDOWN_V2)
     return True
 
-# ... (سایر توابع پردازشگر مانند _process_copy_add_name و غیره بدون تغییر باقی می‌مانند)
 async def _process_copy_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
+    if not text:
+        await update.message.reply_text("❌ نام نمی‌تواند خالی باشد\\. لطفاً یک نام معتبر وارد کنید:", parse_mode=ParseMode.MARKDOWN_V2)
+        return False
     copy_id = context.user_data['temp_copy_id']
-    new_copy = {'id': copy_id, 'name': text, 'settings': {}}
+    new_copy = {'id': copy_id, 'name': text, 'settings': {"DailyDrawdownPercent": 5.0, "AlertDrawdownPercent": 4.0}}
     ecosystem.setdefault('copies', []).append(new_copy)
     ecosystem.setdefault('mapping', {})[copy_id] = []
     if not save_ecosystem(context):
@@ -1074,8 +1175,7 @@ async def _process_copy_add_name(update: Update, context: ContextTypes.DEFAULT_T
     await regenerate_copy_config(copy_id, context)
     log_extra['entity_id'] = copy_id
     logger.info("New copy account added successfully", extra=log_extra)
-    await update.message.reply_text(f"✅ حساب کپی *{escape_markdown_v2(copy_id)}* با موفقیت افزوده شد\\.", parse_mode=ParseMode.MARKDOWN_V2)
-    context.user_data.pop('temp_copy_id', None)
+    await update.message.reply_text(f"✅ حساب کپی *{escape_markdown_v2(text)}* با موفقیت افزوده شد\\.", parse_mode=ParseMode.MARKDOWN_V2)
     return True
 
 async def _process_copy_setting_value(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
@@ -1086,8 +1186,7 @@ async def _process_copy_setting_value(update: Update, context: ContextTypes.DEFA
         raise KeyError("'selected_copy_id' not found. Please re-select the copy account.")
     try:
         value = float(text)
-        if value < 0:
-            raise ValueError("Value cannot be negative.")
+        if value < 0: raise ValueError("Value cannot be negative.")
     except ValueError:
         await update.message.reply_text("❌ ورودی نامعتبر است\\. لطفاً یک عدد مثبت وارد کنید \\(مثال: 4\\.5\\)\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return False
@@ -1105,12 +1204,10 @@ async def _process_copy_setting_value(update: Update, context: ContextTypes.DEFA
     return True
 
 async def _process_conn_volume_value(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
-    waiting_for = context.user_data.get('waiting_for', '')
-    _, vol_type, copy_id, source_id = waiting_for.split(':')
+    _, vol_type, copy_id, source_id = context.user_data.get('waiting_for', ':::').split(':')
     try:
         value = float(text)
-        if value <= 0:
-            raise ValueError("Value must be a positive number.")
+        if value <= 0: raise ValueError("Value must be a positive number.")
     except ValueError:
         await update.message.reply_text("❌ ورودی نامعتبر است\\. لطفاً یک عدد بزرگتر از صفر وارد کنید\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return False
@@ -1126,53 +1223,94 @@ async def _process_conn_volume_value(update: Update, context: ContextTypes.DEFAU
     log_extra.update({'copy_id': copy_id, 'source_id': source_id, 'details': {'type': vol_type, 'value': value}})
     logger.info("Connection volume updated successfully", extra=log_extra)
     await update.message.reply_text("✅ حجم اتصال با موفقیت تنظیم شد\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    await _display_connections_for_copy(update.callback_query or update.message, context, copy_id)
+    return True
+
+async def _process_conn_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
+    """Processes the list of allowed symbols for a connection."""
+    _, copy_id, source_id = context.user_data.get('waiting_for', '::').split(':')
+    if not text:
+        await update.message.reply_text("❌ لیست نمادها نمی‌تواند خالی باشد\\. لطفاً حداقل یک نماد وارد کنید\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        return False
+
+    # پاک‌سازی و فرمت‌بندی ورودی
+    symbols = [s.strip().upper() for s in text.split(';') if s.strip()]
+    if not symbols:
+        await update.message.reply_text("❌ فرمت ورودی نامعتبر است\\. لطفاً نمادها را با سمی‌کالن جدا کنید\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        return False
+    
+    formatted_symbols = ";".join(symbols)
+
+    connection = next((conn for conn in ecosystem.get('mapping', {}).get(copy_id, []) if conn['source_id'] == source_id), None)
+    if not connection:
+        await update.message.reply_text("❌ اتصال مورد نظر یافت نشد\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        return True
+
+    connection['mode'] = 'SYMBOLS'
+    connection['allowed_symbols'] = formatted_symbols
+
+    if not save_ecosystem(context):
+        raise IOError("Failed to save ecosystem after updating allowed symbols")
+    
+    await regenerate_copy_config(copy_id, context)
+    log_extra.update({'copy_id': copy_id, 'source_id': source_id, 'details': {'mode': 'SYMBOLS', 'symbols': formatted_symbols}})
+    logger.info("Connection allowed symbols updated successfully", extra=log_extra)
+    await update.message.reply_text(f"✅ حالت کپی به 'نمادهای خاص' با لیست زیر تغییر کرد:\n`{escape_markdown_v2(formatted_symbols)}`", parse_mode=ParseMode.MARKDOWN_V2)
+    
+    # برای بازگشت به منو، نیاز به یک query داریم. چون در اینجا نداریم، به کاربر پیام می‌دهیم.
     keyboard = [[InlineKeyboardButton("🔙 بازگشت به اتصالات", callback_data=f"conn:select_copy:{copy_id}")]]
     await update.message.reply_text("برای ادامه، به منوی اتصالات بازگردید:", reply_markup=InlineKeyboardMarkup(keyboard))
     return True
+
 # --- Dispatcher Dictionary ---
 STATE_HANDLERS = {
-    # ✅ وضعیت جدید برای افزودن هوشمند
     "source_add_smart_name": _process_source_smart_add,
     "source_edit_name": _process_source_edit_name,
     "copy_add_name": _process_copy_add_name,
 }
 
 # --- Main Text Input Handler ---
+@allowed_users_only
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # (این تابع اصلی با دیکشنری به‌روز شده، بدون تغییر باقی می‌ماند)
-    if not is_user_allowed(update.effective_user.id):
-        return
     waiting_for = context.user_data.get('waiting_for')
     if not waiting_for:
         return
+
     text = update.message.text.strip()
     ecosystem = context.bot_data.get('ecosystem', {})
     user_id = update.effective_user.id
-    log_extra = {'user_id': user_id, 'state': waiting_for, 'text_received': text}
+    log_extra = {'user_id': user_id, 'state': waiting_for, 'text_received': text, 'status': 'processing'}
+    
     handler = STATE_HANDLERS.get(waiting_for)
     if not handler:
         if waiting_for.startswith("copy_"):
             handler = _process_copy_setting_value
         elif waiting_for.startswith("conn_volume:"):
             handler = _process_conn_volume_value
+        elif waiting_for.startswith("conn_symbols:"): # <-- بخش جدید
+            handler = _process_conn_symbols
+
     should_return_to_main_menu = False
     try:
         if handler:
             should_return_to_main_menu = await handler(update, context, text, ecosystem=ecosystem, log_extra=log_extra)
         else:
-            logger.warning("No handler found for an active 'waiting_for' state.", extra=log_extra)
+            logger.warning("No handler found for an active 'waiting_for' state. Clearing state.", extra=log_extra)
             should_return_to_main_menu = True
     except (KeyError, IOError, Exception) as e:
-        error_message = f"❌ یک خطای غیرمنتظره رخ داد: {escape_markdown_v2(str(e))}"
+        error_message = f"❌ یک خطای غیرمنتظره در پردازش ورودی رخ داد\\."
         await update.message.reply_text(error_message, parse_mode=ParseMode.MARKDOWN_V2)
-        log_extra['error'] = str(e)
+        log_extra.update({'error': str(e), 'status': 'failure'})
         logger.error("An exception occurred during text input processing.", extra=log_extra)
+        await notify_admin_on_error(context, "handle_text_input", e, waiting_for=waiting_for)
         should_return_to_main_menu = True
     finally:
         if should_return_to_main_menu:
             context.user_data.clear()
-            logger.debug("State cleared. Returning to main menu.", extra={'user_id': user_id})
-            await start(update, context)
+            logger.debug("State cleared after text input processing.", extra={'user_id': user_id})
+            # به جای فراخوانی start، به کاربر اجازه می‌دهیم خودش با دکمه‌ها ادامه دهد
+            # این کار از ارسال پیام‌های ناخواسته جلوگیری می‌کند.
+
 
 
 
