@@ -11,6 +11,8 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 import json
 from logging.handlers import RotatingFileHandler
+import sqlite3
+import datetime # برای timestamp
 
 # --- فاز ۱: راه‌اندازی لاگ‌گیری حرفه‌ای با فرمت JSON ---
 
@@ -45,10 +47,9 @@ console_handler.setLevel(logging.INFO) # فقط پیام‌های مهم به ب
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 
 # ۲. لاگ‌گیری در فایل (برای ذخیره‌سازی) - با فرمت جدید JSON
-# فایل لاگ به صورت خودکار پس از رسیدن به حجم ۵ مگابایت، آرشیو می‌شود.
 file_handler = RotatingFileHandler('watcher.log', maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')
-file_handler.setLevel(logging.DEBUG) # تمام جزئیات در فایل ذخیره شود
-file_handler.setFormatter(JsonFormatter()) # استفاده از فرمتر جدید
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(JsonFormatter()) 
 
 # حذف مدیریت‌کننده‌های قبلی برای جلوگیری از لاگ تکراری
 if logger.hasHandlers():
@@ -75,38 +76,131 @@ ECOSYSTEM_PATH = os.getenv("ECOSYSTEM_PATH")
 
 
 
-
-
 # --- فاز ۱، بخش دوم: مدیریت وضعیت اتمیک و بهینه ---
 
 # State file path for stateless operation
 WATCHER_STATE_PATH = os.path.join(os.path.dirname(ECOSYSTEM_PATH) if ECOSYSTEM_PATH else '.', 'watcher_state.json') if ECOSYSTEM_PATH else 'watcher_state.json'
+# --- جدید: مسیر پایگاه داده آمار ---
+DB_PATH = os.path.join(os.path.dirname(WATCHER_STATE_PATH), 'trade_history.db')
+SOURCE_STATUS_PATH = os.path.join(os.path.dirname(WATCHER_STATE_PATH), 'source_status.json')
 
 source_name_map = {}
 state_data = {}  # دیکشنری وضعیت سراسری
 state_changed = False  # فلگ برای ذخیره‌سازی دسته‌ای
 
+source_statuses = {} 
+
+# --- جدید: تابع ایجاد پایگاه داده و جدول ---
+def initialize_database():
+    """
+    پایگاه داده SQLite و جدول تاریخچه معاملات را در صورت عدم وجود ایجاد می‌کند.
+    """
+    log_extra = {'entity_id': DB_PATH}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                copy_id TEXT NOT NULL,
+                source_id TEXT, -- می‌تواند از روی source_file یا state استخراج شود
+                source_account_number INTEGER,
+                symbol TEXT NOT NULL,
+                profit REAL NOT NULL,
+                source_file TEXT -- نام فایل سورس برای شناسایی منبع
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized successfully.", extra={**log_extra, 'status': 'success'})
+    except sqlite3.Error as e:
+        logger.error("Failed to initialize database.", extra={**log_extra, 'error': str(e), 'status': 'failure'})
+    except Exception as e:
+         logger.critical("Unexpected error during database initialization.", extra={**log_extra, 'error': str(e), 'status': 'failure'})
+
+# --- پایان تابع جدید ---
+
+# --- جدید: تابع ذخیره معامله در دیتابیس ---
+async def save_trade_to_db(trade_data: dict):
+    """
+    اطلاعات معامله بسته شده را در پایگاه داده SQLite ذخیره می‌کند.
+    (نسخه اصلاح شده با ساختار جدید source_name_map)
+    """
+    log_extra = {'entity_id': trade_data.get('source_ticket', 'N/A'), 'status': 'pending_save'}
+    required_keys = ['copy_id', 'symbol', 'profit', 'source_file', 'source_account_number', 'source_ticket'] # source_ticket هم اضافه شد
+    if not all(key in trade_data for key in required_keys):
+        logger.warning("Missing required data for saving trade to DB.", extra={**log_extra, 'details': trade_data, 'status': 'save_skipped'})
+        return
+
+    # استخراج source_id و source_name از source_name_map بر اساس source_file
+    source_info = source_name_map.get(trade_data['source_file'])
+    source_id = source_info['id'] if source_info else None
+    source_name_for_state = source_info['name'] if source_info else trade_data['source_file'] # نام برای ذخیره در state
+
+    # --- اصلاح شده: آپدیت state با نام منبع ---
+    global state_data, state_changed
+    if state_data.get(str(trade_data['source_ticket'])) != source_name_for_state: # کلید state باید رشته باشد
+        state_data[str(trade_data['source_ticket'])] = source_name_for_state
+        state_changed = True
+    # --- پایان اصلاح ---
+
+
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO trades (timestamp, copy_id, source_id, source_account_number, symbol, profit, source_file)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            timestamp,
+            trade_data['copy_id'],
+            source_id, # حالا ID صحیح ذخیره می‌شود
+            trade_data['source_account_number'],
+            trade_data['symbol'],
+            trade_data['profit'],
+            trade_data['source_file']
+        ))
+        conn.commit()
+        conn.close()
+        logger.info(f"Trade saved to DB successfully.", extra={**log_extra,'db_id': cursor.lastrowid, 'status': 'save_success'})
+
+        # --- اصلاح شده: حذف از state پس از ذخیره ---
+        if str(trade_data['source_ticket']) in state_data:
+            del state_data[str(trade_data['source_ticket'])]
+            state_changed = True
+        # --- پایان اصلاح ---
+
+    except sqlite3.Error as e:
+        logger.error("Failed to save trade to DB.", extra={**log_extra, 'error': str(e), 'status': 'save_failure'})
+    except Exception as e:
+         logger.critical("Unexpected error during saving trade to DB.", extra={**log_extra, 'error': str(e), 'status': 'save_failure'})
+
+# --- پایان تابع جدید ---
+
 def load_source_names():
     """
-    نام‌های نمایشی منابع را از فایل ecosystem.json بارگذاری می‌کند.
-    این تابع با مدیریت خطای کامل نوشته شده است.
+    نام‌های نمایشی و ID منابع را از فایل ecosystem.json بارگذاری می‌کند.
+    ساختار source_name_map به {file_path: {'name': name, 'id': id}} تغییر می‌کند.
     """
     global source_name_map
+    source_name_map = {} # پاک کردن مپ قبلی
     if not ECOSYSTEM_PATH:
         logger.warning("ECOSYSTEM_PATH not set. Skipping source names load.", extra={'status': 'skipped'})
         return
     try:
         with open(ECOSYSTEM_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        # فقط منابعی که file_path و name دارند را استخراج می‌کند
-        temp_map = {
-            source['file_path']: source['name'] 
-            for source in data.get('sources', []) 
-            if 'file_path' in source and 'name' in source
-        }
-        # فقط در صورت موفقیت کامل، متغیر سراسری را به‌روزرسانی کن
-        source_name_map = temp_map
-        logger.info(f"Loaded {len(source_name_map)} source names from ecosystem.json.", extra={'status': 'success'})
+
+        temp_map = {}
+        for source in data.get('sources', []):
+            if 'file_path' in source and 'name' in source and 'id' in source:
+                temp_map[source['file_path']] = {'name': source['name'], 'id': source['id']}
+
+        source_name_map = temp_map # فقط در صورت موفقیت کامل، متغیر سراسری را به‌روزرسانی کن
+        logger.info(f"Loaded {len(source_name_map)} source names and IDs from ecosystem.json.", extra={'status': 'success'})
     except FileNotFoundError:
         logger.warning(f"ecosystem.json not found at {ECOSYSTEM_PATH}. Using empty source map.", extra={'entity_id': ECOSYSTEM_PATH})
     except json.JSONDecodeError as e:
@@ -231,176 +325,185 @@ async def send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, message: str):
 
 # --- فاز ۲، بخش اول: تجزیه لاگ با Regex (Robust Parsing) ---
 
-# الگوهای Regex از پیش کامپایل شده برای عملکرد بهتر
-# این الگوها مشکل اصلی Parse Error را برای همیشه حل می‌کنند.
-open_pattern = re.compile(r'\[TRADE_OPEN\]\s+(.*)')
-close_pattern = re.compile(r'\[TRADE_CLOSE\]\s+(.*)')
-alert_pattern = re.compile(r'\[DD_ALERT\]\s+(.*)')
-stop_pattern = re.compile(r'\[DD_STOP\]\s+(.*)')
-error_pattern = re.compile(r'\[ERROR\]\s+-\s+(.*)')
+# --- تغییر: الگوهای Regex برای فرمت جدید لاگ‌ها ---
+# مثال OPEN: copy_A,XAUUSD,0.11 (Source:0.11,Mult:1.00),2345.71000,178661555,TradeCopier_S2.txt,1234567
+open_pattern = re.compile(r'\[TRADE_OPEN\]\s+([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),(\d+)')
+# مثال CLOSE: copy_A,XAUUSD,178662307,-5.06,TradeCopier_S2.txt,1234567
+close_pattern = re.compile(r'\[TRADE_CLOSE\]\s+([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),(\d+)')
+alert_pattern = re.compile(r'\[DD_ALERT\]\s+(.*)') # بدون تغییر
+stop_pattern = re.compile(r'\[DD_STOP\]\s+(.*)')   # بدون تغییر
+error_pattern = re.compile(r'\[ERROR\]\s+-\s+(.*)') # بدون تغییر
 
-def parse_and_format_log_line(line: str, state: dict) -> str | None:
+def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
     """
-    یک خط لاگ را با استفاده از Regex تجزیه و به یک پیام خوانا برای تلگرام تبدیل می‌کند.
-    این تابع در مقابل فرمت‌های مختلف مقاوم است و خطاهای تجزیه را مدیریت می‌کند.
+    یک خط لاگ را با استفاده از Regex تجزیه، به پیام تلگرام تبدیل کرده
+    و در صورت لزوم، دیکشنری داده برای ذخیره در DB را برمی‌گرداند.
     """
-    global state_changed
-
     line = line.strip()
     if not line:
-        return None
+        return None, None
+
+    formatted_message = None
+    trade_data_for_db = None
 
     try:
-        # --- پردازش لاگ TRADE_OPEN ---
+        # --- پردازش لاگ TRADE_OPEN (با فرمت جدید ۷ فیلدی) ---
         if match := open_pattern.search(line):
-            # مثال: copy_A,XAUUSD,0.11 (Source:0.11,Mult:1.00),4245.71000,178661555,TradeCopier_S2.txt
-            parts_str = match.group(1)
-            # از Regex برای جدا کردن بخش‌ها به صورت امن استفاده می‌کنیم
-            parts = re.match(r'([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+)', parts_str)
-            if not parts or len(parts.groups()) != 6:
-                raise ValueError(f"Invalid OPEN format: {parts_str}")
-            
-            copy_id, symbol, volume_info, price, source_ticket, source_file = [p.strip() for p in parts.groups()]
-            source_name = source_name_map.get(source_file, source_file)
-            
-            # ذخیره نام منبع برای استفاده در لاگ TRADE_CLOSE
-            if state.get(source_ticket) != source_name:
-                state[source_ticket] = source_name
+            parts = [p.strip() for p in match.groups()]
+            if len(parts) != 7:
+                 raise ValueError(f"Invalid OPEN format: expected 7 parts, got {len(parts)}")
+
+            copy_id, symbol, volume_info, price, source_ticket_str, source_file, source_account_number_str = parts
+            source_account_number = int(source_account_number_str)
+
+            # استخراج نام خوانا از مپ جدید
+            source_info = source_name_map.get(source_file)
+            source_display_name = source_info['name'] if source_info else source_file
+
+            # --- اصلاح: فقط آپدیت state در اینجا، حذف در save_trade_to_db ---
+            global state_data, state_changed
+            if state_data.get(source_ticket_str) != source_display_name: # کلید state باید رشته باشد
+                state_data[source_ticket_str] = source_display_name
                 state_changed = True
-                
-            return (
+            # --- پایان اصلاح ---
+
+            formatted_message = (
                 f"✅ *New Position Opened*\n\n"
-                f"*Source:* `{source_name}`\n"
+                f"*Source:* `{source_display_name}` (Acc: `{source_account_number}`)\n" # شماره اکانت اضافه شد
                 f"*Copy Account:* `{copy_id}`\n"
                 f"*Symbol:* `{symbol}`\n"
                 f"*Volume:* `{volume_info}`\n"
                 f"*Open Price:* `{price}`\n"
-                f"*Source Ticket:* `{source_ticket}`"
+                f"*Source Ticket:* `{source_ticket_str}`"
             )
 
-        # --- پردازش لاگ TRADE_CLOSE ---
+        # --- پردازش لاگ TRADE_CLOSE (با فرمت جدید ۶ فیلدی) ---
         elif match := close_pattern.search(line):
-            parts = match.group(1).split(',')
-            # فرمت جدید با نام فایل: copy_A,XAUUSD,178662307,-5.06,TradeCopier_S2.txt
-            if len(parts) == 5:
-                copy_id, symbol, source_ticket, profit_str, source_file = [p.strip() for p in parts]
-                source_name = source_name_map.get(source_file, source_file)
-            # فرمت قدیمی برای سازگاری: copy_A,XAUUSD,178662307,-5.06
-            elif len(parts) == 4:
-                copy_id, symbol, source_ticket, profit_str = [p.strip() for p in parts]
-                # نام منبع را از وضعیت ذخیره شده می‌خوانیم
-                source_name = state.get(source_ticket, 'Unknown Source')
-            else:
-                raise ValueError(f"Invalid CLOSE format: expected 4 or 5 parts, got {len(parts)}")
-            
+            parts = [p.strip() for p in match.groups()]
+            if len(parts) != 6:
+                raise ValueError(f"Invalid CLOSE format: expected 6 parts, got {len(parts)}")
+
+            copy_id, symbol, source_ticket_str, profit_str, source_file, source_account_number_str = parts
             profit = float(profit_str)
+            source_account_number = int(source_account_number_str)
+
+            # --- اصلاح: خواندن نام منبع از state ---
+            source_display_name = state_data.get(source_ticket_str, source_file) # اگر در state نبود از نام فایل استفاده کن
+            # --- پایان اصلاح ---
+
             profit_text = f"+${profit:,.2f}" if profit >= 0 else f"-${abs(profit):,.2f}"
             emoji = "☑️" if profit >= 0 else "🔻"
-            
-            # پس از بسته شدن، اطلاعات معامله را از وضعیت حذف می‌کنیم
-            if source_ticket in state:
-                del state[source_ticket]
-                state_changed = True
-                
-            return (
+
+            formatted_message = (
                 f"{emoji} *Position Closed*\n\n"
-                f"*Source:* `{source_name}`\n"
+                f"*Source:* `{source_display_name}` (Acc: `{source_account_number}`)\n" # شماره اکانت اضافه شد
                 f"*Copy Account:* `{copy_id}`\n"
                 f"*Symbol:* `{symbol}`\n"
                 f"*Profit/Loss:* `{profit_text}`\n"
-                f"*Source Ticket:* `{source_ticket}`"
+                f"*Source Ticket:* `{source_ticket_str}`"
             )
 
-        # --- پردازش لاگ DD_ALERT ---
+            # --- جدید: آماده‌سازی داده برای ذخیره در دیتابیس ---
+            trade_data_for_db = {
+                'copy_id': copy_id,
+                'symbol': symbol,
+                'profit': profit,
+                'source_file': source_file,
+                'source_account_number': source_account_number,
+                'source_ticket': source_ticket_str # تیکت برای حذف از state لازم است
+            }
+            # --- پایان بخش جدید ---
+
+        # --- پردازش لاگ‌های DD_ALERT, DD_STOP, ERROR (بدون تغییر عمده) ---
         elif match := alert_pattern.search(line):
-            parts = [p.strip() for p in match.group(1).split(',')]
-            if len(parts) != 5:
+             parts = [p.strip() for p in match.group(1).split(',')]
+             if len(parts) != 5:
                 raise ValueError(f"Invalid ALERT format: expected 5 parts, got {len(parts)}")
-            copy_id, dd, dollar_loss, start_equity, peak_equity = parts
-            return (
+             copy_id, dd, dollar_loss, start_equity, peak_equity = parts
+             formatted_message = (
                 f"🟡 *Daily Drawdown Alert*\n\n"
                 f"*Account:* `{copy_id}`\n"
                 f"*Current Loss:* `%{float(dd):.2f}` `(-${float(dollar_loss):,.2f})`\n"
                 f"*Daily Start Equity:* `${float(start_equity):,.2f}`\n"
                 f"*Daily Peak Equity:* `${float(peak_equity):,.2f}`"
-            )
+             )
 
-        # --- پردازش لاگ DD_STOP ---
+
         elif match := stop_pattern.search(line):
-            parts = [p.strip() for p in match.group(1).split(',')]
-            if len(parts) != 6:
+             parts = [p.strip() for p in match.group(1).split(',')]
+             if len(parts) != 6:
                 raise ValueError(f"Invalid STOP format: expected 6 parts, got {len(parts)}")
-            copy_id, dd, dd_limit, dollar_loss, start_equity, peak_equity = parts
-            return (
+             copy_id, dd, dd_limit, dollar_loss, start_equity, peak_equity = parts
+             formatted_message = (
                 f"🔴 *Copy Stopped Due to DD Limit*\n\n"
                 f"*Account:* `{copy_id}`\n"
                 f"*Loss at Stop:* `%{float(dd):.2f}` `(-${float(dollar_loss):,.2f})`\n"
                 f"*Stop Threshold:* `%{float(dd_limit):,.2f}`"
-            )
+             )
 
-        # --- پردازش لاگ ERROR ---
         elif match := error_pattern.search(line):
-            error_message = match.group(1).strip()
-            # خطاهای مربوط به عدم یافتن فایل سورس را نادیده می‌گیریم تا اسپم نشود
-            if "Failed to open source file" in error_message:
-                logger.debug("Ignoring non-critical source file error.", extra={'details': error_message})
-                return None
-            return f"🚨 *Expert Error*\n\n`{error_message}`"
+             error_message = match.group(1).strip()
+             # ... (بقیه کد ERROR مثل قبل) ...
+             if "Failed to open source file" in error_message:
+                 logger.debug("Ignoring non-critical source file error.", extra={'details': error_message})
+                 return None, None # هیچ پیامی برنگردان
+             formatted_message = f"🚨 *Expert Error*\n\n`{error_message}`"
 
-    except (ValueError, IndexError) as e:
-        # اگر هرگونه خطایی در تجزیه رخ داد، آن را به عنوان هشدار لاگ کرده و به تلگرام ارسال می‌کنیم
-        logger.warning(f"Malformed log line skipped: '{line}'. Error: {e}", extra={'status': 'parse_error'})
-        return f"⚠️ *Parse Error in Log*\n`{line}`"
 
-    return None
+    except (ValueError, IndexError, TypeError) as e:
+        logger.warning(f"Malformed log line skipped: '{line}'. Error: {e}", extra={'status': 'parse_error', 'line': line})
+        formatted_message = f"⚠️ *Parse Error in Log*\n`{line}`"
+        trade_data_for_db = None # در صورت خطا، داده‌ای ذخیره نشود
+
+    return formatted_message, trade_data_for_db
+# --- پایان بازنویسی ---
 
 # --- پایان بخش تجزیه لاگ ---
 
 
 
 
-# --- فاز ۳، بخش اول: نظارت ناهمزمان بر فایل‌ها ---
+# --- فاز ۳، بخش اول: نظارت ناهمزمان بر فایل‌ها (نسخه اصلاح شده) ---
 
-async def follow_log_file(context: ContextTypes.DEFAULT_TYPE, filepath: str, state: dict):
+async def follow_log_file(context: ContextTypes.DEFAULT_TYPE, filepath: str):
     """
-    یک فایل لاگ را به صورت ناهمزمان دنبال کرده و خطوط جدید را پردازش می‌کند.
-    این تابع برای مدیریت بهتر خطاها و لغو شدن تسک بهینه شده است.
+    یک فایل لاگ را به صورت ناهمزمان دنبال کرده، خطوط جدید را پردازش،
+    پیام تلگرام ارسال کرده و داده‌های معامله را برای ذخیره در DB ارسال می‌کند.
     """
     task_name = asyncio.current_task().get_name()
     log_extra = {'task_name': task_name, 'entity_id': os.path.basename(filepath)}
-    
+
     logger.info("Starting to watch log file.", extra=log_extra)
-    
+
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
-            # رفتن به انتهای فایل برای خواندن خطوط جدید
-            f.seek(0, 2)
+            f.seek(0, 2) # رفتن به انتهای فایل
             while True:
                 line = f.readline()
                 if not line:
-                    await asyncio.sleep(1) # اگر خط جدیدی نبود، یک ثانیه صبر کن
+                    await asyncio.sleep(1) # اگر خط جدیدی نبود، صبر کن
                     continue
-                
-                # پردازش خط و دریافت پیام فرمت شده
-                formatted_message = parse_and_format_log_line(line, state)
-                
+
+                # --- تغییر: دریافت هر دو مقدار بازگشتی ---
+                formatted_message, trade_data_for_db = parse_and_format_log_line(line)
+
+                # اگر پیامی برای ارسال وجود داشت
                 if formatted_message:
-                    # استفاده از تابع ارسال هوشمند جدید
                     await send_telegram_alert(context, formatted_message)
+
+                # --- جدید: اگر داده‌ای برای ذخیره در DB وجود داشت ---
+                if trade_data_for_db:
+                    await save_trade_to_db(trade_data_for_db)
+                # --- پایان بخش جدید ---
 
     except FileNotFoundError:
         logger.warning("Log file was not found or has been deleted. Task is stopping.", extra=log_extra)
     except asyncio.CancelledError:
-        logger.info("Log file watch task has been cancelled (likely due to a new log file).", extra=log_extra)
-        # این خطا طبیعی است و نیازی به اقدام خاصی ندارد
-        pass
+        logger.info("Log file watch task has been cancelled.", extra=log_extra)
+        pass # این خطا طبیعی است
     except Exception as e:
         logger.error("An unexpected error occurred while watching log file.", extra={**log_extra, 'error': str(e), 'status': 'failure'})
-        # در صورت بروز خطای ناشناخته، به ادمین اطلاع بده
         await send_telegram_alert(context, f"🚨 *Critical Watcher Error*\n\nTask `{task_name}` failed while watching `{os.path.basename(filepath)}`\nError: `{str(e)}`")
-
-# --- پایان بخش نظارت بر فایل‌ها ---#
-
 
 
 
@@ -427,6 +530,110 @@ async def health_checker():
         await asyncio.sleep(300) # هر ۵ دقیقه یک بار
         logger.info("Watcher health check: Alive and monitoring.", extra={'status': 'healthy'})
 
+
+
+
+async def source_health_check(context: ContextTypes.DEFAULT_TYPE):
+    """
+    به صورت دوره‌ای زمان آخرین تغییر فایل‌های سورس را بررسی کرده و
+    در صورت عدم به‌روزرسانی، هشدار قطع ارتباط ارسال می‌کند.
+    """
+    global source_statuses
+    DISCONNECT_THRESHOLD = 120 # ثانیه (۲ دقیقه)
+    ALERT_COOLDOWN = 300       # ثانیه (۵ دقیقه) - جلوگیری از هشدار تکراری قطع ارتباط
+
+    while True:
+        await asyncio.sleep(60) # هر ۶۰ ثانیه یک بار چک کن
+        now = time.time()
+        log_extra_base = {'task_name': 'SourceHealthCheck'}
+
+        if not source_name_map:
+            logger.debug("Source name map is empty, skipping health check.", extra=log_extra_base)
+            continue
+
+        active_source_files = set(source_name_map.keys())
+        checked_files = set()
+
+        for file_path, source_info in source_name_map.items():
+            source_id = source_info.get('id', 'N/A')
+            source_name = source_info.get('name', file_path)
+            full_path = os.path.join(LOG_DIRECTORY_PATH, file_path) if LOG_DIRECTORY_PATH else file_path # مسیر کامل فایل سورس
+            log_extra = {**log_extra_base, 'entity_id': file_path, 'source_name': source_name}
+            checked_files.add(file_path)
+
+            try:
+                last_modified_time = os.path.getmtime(full_path)
+                time_since_update = now - last_modified_time
+                current_status_info = source_statuses.get(file_path, {"status": "connected", "last_alert_time": 0})
+                current_status = current_status_info["status"]
+
+                # --- منطق قطع ارتباط ---
+                if time_since_update > DISCONNECT_THRESHOLD:
+                    if current_status == "connected":
+                        # فقط اگر وضعیت قبلی "وصل" بود، هشدار قطع بده
+                        message = f"⚠️ *Source Disconnected*\n\nSource `{source_name}` (File: `{file_path}`) has not updated in over {DISCONNECT_THRESHOLD // 60} minutes."
+                        await send_telegram_alert(context, message)
+                        source_statuses[file_path] = {"status": "disconnected", "last_alert_time": now}
+                        logger.warning(f"Source '{source_name}' seems disconnected (no update for {time_since_update:.0f}s).", extra=log_extra)
+                    elif now - current_status_info.get("last_alert_time", 0) > ALERT_COOLDOWN:
+                         # اگر قبلا قطع بوده و زمان زیادی گذشته، دوباره هشدار بده
+                         logger.info(f"Source '{source_name}' remains disconnected (no update for {time_since_update:.0f}s). Re-alerting.", extra=log_extra)
+                         message = f"🕒 *Source Still Disconnected*\n\nSource `{source_name}` (File: `{file_path}`) remains inactive."
+                         await send_telegram_alert(context, message)
+                         source_statuses[file_path]["last_alert_time"] = now # زمان آخرین هشدار آپدیت شود
+
+                # --- منطق اتصال مجدد ---
+                else:
+                    if current_status == "disconnected":
+                        message = f"✅ *Source Reconnected*\n\nSource `{source_name}` (File: `{file_path}`) is now updating again."
+                        await send_telegram_alert(context, message)
+                        source_statuses[file_path] = {"status": "connected", "last_alert_time": 0} # ریست کردن وضعیت
+                        logger.info(f"Source '{source_name}' reconnected.", extra=log_extra)
+                    # else: وضعیت 'connected' بوده و هنوز هم هست، کاری نکن
+
+            except FileNotFoundError:
+                if file_path not in source_statuses or source_statuses[file_path]["status"] != "file_not_found":
+                     # اگر فایل برای اولین بار پیدا نشد یا وضعیت قبلی چیز دیگری بود
+                     message = f"❌ *Source File Not Found*\n\nFile `{file_path}` for source `{source_name}` was not found. Ensure the source EA is configured correctly."
+                     await send_telegram_alert(context, message)
+                     source_statuses[file_path] = {"status": "file_not_found", "last_alert_time": now}
+                     logger.error(f"Source file not found: {full_path}", extra=log_extra)
+            except Exception as e:
+                logger.error(f"Error checking source file status for {file_path}: {e}", extra={**log_extra, 'error': str(e)})
+
+        # --- پاک کردن سورس‌های حذف شده از ecosystem.json ---
+        removed_files = set(source_statuses.keys()) - checked_files
+        for removed_file in removed_files:
+            del source_statuses[removed_file]
+            logger.info(f"Removed '{removed_file}' from health check status (no longer in ecosystem).", extra=log_extra_base)
+# --- پایان تابع جدید ---
+
+
+
+async def save_source_statuses_periodically():
+    global source_statuses
+    log_extra = {'task_name': 'StatusSaver'}
+    while True:
+        await asyncio.sleep(15) 
+        tmp_path = SOURCE_STATUS_PATH + '.tmp'
+        try:
+            status_to_save = {fp: info.get("status", "unknown") for fp, info in source_statuses.items()}
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(status_to_save, f, ensure_ascii=False)
+            os.replace(tmp_path, SOURCE_STATUS_PATH)
+            logger.debug(f"Saved {len(status_to_save)} source statuses.", extra=log_extra)
+        except Exception as e:
+            logger.error("Failed to save source status file.", extra={**log_extra, 'error': str(e)})
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception as remove_e:
+                    logger.error(f"Failed to remove temporary status file.", extra={**log_extra, 'error': str(remove_e)})
+
+
+
+
+
 async def main():
     """
     تابع اصلی برنامه که تمام تسک‌ها را راه‌اندازی و مدیریت می‌کند.
@@ -435,57 +642,56 @@ async def main():
         logger.critical("Missing essential environment variables (BOT_TOKEN, ADMIN_ID, LOG_DIRECTORY_PATH). Exiting.")
         return
 
-    # استفاده از ApplicationBuilder برای ساختار مدرن
     application = Application.builder().token(BOT_TOKEN).build()
     logger.info("Log Watcher v3.3 Professional Edition started.")
+    initialize_database()
+
 
     global state_data
     state_data = load_watcher_state()
 
-    # راه‌اندازی تسک‌های پس‌زمینه
     asyncio.create_task(batch_state_saver(state_data), name="StateSaver")
     asyncio.create_task(health_checker(), name="HealthChecker")
 
-    watched_slaves = {} # دیکشنری برای نگهداری تسک‌های فعال
+    asyncio.create_task(source_health_check(application), name="SourceHealthCheck")
+
+    asyncio.create_task(save_source_statuses_periodically(), name="SourceStatusSaver")
+
+
+    watched_slaves = {}
 
     while True:
         try:
-            # بارگذاری مجدد نام سورس‌ها برای دریافت تغییرات
-            load_source_names()
+            load_source_names() 
 
             log_pattern = os.path.join(LOG_DIRECTORY_PATH, "TradeCopier_*.log")
             all_files = glob(log_pattern)
 
             slaves_logs = {}
             for f in all_files:
-                # پیدا کردن شناسه slave از نام فایل
                 match = re.search(r"TradeCopier_(.*?)_\d{4}\.\d{2}\.\d{2}\.log", os.path.basename(f))
                 if match:
                     slave_id = match.group(1)
-                    # اگر slave_id خالی بود (مربوط به اکسپرت سورس)، نادیده بگیر
                     if slave_id:
                         slaves_logs.setdefault(slave_id, []).append(f)
 
             for slave_id, files in slaves_logs.items():
                 latest_file = max(files, key=os.path.getctime)
-                
-                # اگر این slave برای اولین بار است که دیده می‌شود یا فایل لاگ آن تغییر کرده
+
                 if slave_id not in watched_slaves or watched_slaves[slave_id]['filepath'] != latest_file:
                     if slave_id in watched_slaves:
                         logger.info(f"Switching log file for '{slave_id}'.", extra={'entity_id': slave_id, 'details': f"From {os.path.basename(watched_slaves[slave_id]['filepath'])} to {os.path.basename(latest_file)}"})
-                        # تسک قدیمی را لغو کن
                         watched_slaves[slave_id]['task'].cancel()
-                    
-                    # تسک جدید برای فایل جدید ایجاد کن
-                    task = asyncio.create_task(follow_log_file(application, latest_file, state_data))
+
+                    task = asyncio.create_task(follow_log_file(application, latest_file)) # state_data دیگر لازم نیست پاس داده شود
                     task.set_name(f"watcher_{slave_id}")
                     watched_slaves[slave_id] = {'filepath': latest_file, 'task': task}
 
-            await asyncio.sleep(60) # هر ۶۰ ثانیه یک بار بررسی مجدد
+            await asyncio.sleep(60)
 
         except Exception as e:
             logger.critical("A critical error occurred in the main loop.", extra={'error': str(e), 'status': 'main_loop_failure'})
-            await asyncio.sleep(60) # قبل از تلاش مجدد، کمی صبر کن
+            await asyncio.sleep(60)
 
 if __name__ == "__main__":
     try:

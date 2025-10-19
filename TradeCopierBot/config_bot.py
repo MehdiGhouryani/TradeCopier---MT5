@@ -2,17 +2,21 @@ import os
 import logging
 import json
 import traceback
-import html
-import re
+import sqlite3
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.error import BadRequest
 from functools import wraps
 import glob
-from datetime import datetime
 from telegram.constants import ParseMode
 from logging.handlers import RotatingFileHandler
+from datetime import datetime, timedelta
+
+
+
+
+
 
 class JsonFormatter(logging.Formatter):
     """Custom formatter to output logs in JSON format."""
@@ -44,6 +48,11 @@ logger.addHandler(file_handler)
 
 logging.getLogger('httpx').setLevel(logging.WARNING)
 
+
+
+
+
+
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 1717599240))
@@ -64,10 +73,19 @@ else:
     logger.critical("ECOSYSTEM_PATH not set", extra={'status': 'failure'})
     raise ValueError("ECOSYSTEM_PATH is missing")
 
+
+DB_PATH = os.path.join(os.path.dirname(ECOSYSTEM_PATH) if ECOSYSTEM_PATH else '.', 'trade_history.db')
+SOURCE_STATUS_PATH = os.path.join(os.path.dirname(ECOSYSTEM_PATH) if ECOSYSTEM_PATH else '.', 'source_status.json')
+
+
 def escape_markdown_v2(text: str) -> str:
     """Escapes special characters for Telegram's MarkdownV2 format."""
     escape_chars = r'_*[]()~`>#+-=|{}.!\\'
     return ''.join(f'\\{char}' if char in escape_chars else char for char in str(text))
+
+
+
+
 
 async def notify_admin_on_error(context: ContextTypes.DEFAULT_TYPE, function_name: str, error: Exception, **kwargs):
     """Send formatted error message to admin."""
@@ -84,18 +102,32 @@ async def notify_admin_on_error(context: ContextTypes.DEFAULT_TYPE, function_nam
     except Exception as e:
         logger.error("Failed to send error notification", extra={'status': 'failure', 'error': str(e)})
 
+
+
+
 async def get_detailed_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Generate a formatted status string for the system."""
     ecosystem = context.bot_data.get('ecosystem', {})
     if not ecosystem:
-        return "> ❌ *خطا: داده‌های سیستم بارگذاری نشده‌اند.*"
-    try:
-        last_mod_timestamp = os.path.getmtime(ECOSYSTEM_PATH)
-        last_mod_time = datetime.fromtimestamp(last_mod_timestamp).strftime('%Y-%m-%d %H:%M:%S')
-    except FileNotFoundError:
-        last_mod_time = "ناموجود"
+        return "> ❌ *خطا: داده‌های سیستم بارگذاری نشده‌اند\\.*"
 
-    source_map = {s['id']: s for s in ecosystem.get('sources', [])}
+    source_statuses = load_source_statuses()
+
+    last_mod_time = "نامشخص"
+    try:
+        if ECOSYSTEM_PATH and os.path.exists(ECOSYSTEM_PATH):
+             last_mod_timestamp = os.path.getmtime(ECOSYSTEM_PATH)
+             last_mod_time = datetime.fromtimestamp(last_mod_timestamp).strftime('%Y-%m-%d %H:%M:%S')
+        else:
+             last_mod_time = "فایل یافت نشد"
+             logger.warning(f"Ecosystem path not found or not set for timestamp check: {ECOSYSTEM_PATH}")
+    except Exception as e:
+        last_mod_time = "خطا در خواندن"
+        logger.error(f"Error getting ecosystem file modification time: {e}", exc_info=True)
+
+
+    source_map = {s['file_path']: s for s in ecosystem.get('sources', []) if 'file_path' in s}
+    source_id_to_filepath = {s['id']: s['file_path'] for s in ecosystem.get('sources', []) if 'id' in s and 'file_path' in s}
+
     status_lines = [
         f"> 🏛️ *وضعیت سیستم*",
         f"> 🕓 *آخرین به‌روزرسانی:* {escape_markdown_v2(last_mod_time)}",
@@ -111,11 +143,13 @@ async def get_detailed_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
             settings = copy_account.get('settings', {})
             dd = float(settings.get("DailyDrawdownPercent", 0))
             risk_text = escape_markdown_v2(f"{dd:.2f}%") if dd > 0 else "غیرفعال"
-            flag_file_path = os.path.join(os.path.dirname(ECOSYSTEM_PATH), f"{copy_id}_stopped.flag")
-            status_emoji = "🔴" if os.path.exists(flag_file_path) else "🟢"
-            status_text = "متوقف" if status_emoji == "🔴" else "فعال"
+            flag_file_path = os.path.join(os.path.dirname(ECOSYSTEM_PATH) if ECOSYSTEM_PATH else '.', f"{copy_id}_stopped.flag")
+
+            copy_status_emoji = "🛑" if os.path.exists(flag_file_path) else "✅"
+            copy_status_text = "متوقف" if copy_status_emoji == "🛑" else "فعال"
+
             copy_name_escaped = escape_markdown_v2(copy_account['name'])
-            header = f"> 🛡️ *حساب کپی:* {copy_name_escaped} \\({status_emoji} {status_text}\\)"
+            header = f"> 🛡️ *حساب کپی:* {copy_name_escaped} \\({copy_status_emoji} {copy_status_text}\\)"
             status_lines.append(header)
             status_lines.append(f"> ▫️ *ریسک روزانه:* {risk_text}")
             connections = ecosystem.get('mapping', {}).get(copy_id, [])
@@ -125,15 +159,36 @@ async def get_detailed_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
                 status_lines.append("> ▫️ *اتصالات:*")
                 for conn in connections:
                     source_id = conn.get('source_id')
-                    if source_id in source_map:
-                        vs = conn.get('volume_settings', {})
-                        mode = "Fixed" if "FixedVolume" in vs else "Multiplier"
-                        value = vs.get("FixedVolume", vs.get("Multiplier", "1.0"))
-                        source_name_escaped = escape_markdown_v2(source_map[source_id]['name'])
-                        status_lines.append(f">       └── *{source_name_escaped}* ⟵ `{mode}: {escape_markdown_v2(str(value))}`")
+                    source_filepath = source_id_to_filepath.get(source_id)
+
+                    if source_filepath and source_filepath in source_map:
+                         source_info = source_map[source_filepath]
+                         vs = conn.get('volume_settings', {})
+                         mode = "Fixed" if "FixedVolume" in vs else "Multiplier"
+                         value = vs.get("FixedVolume", vs.get("Multiplier", "1.0"))
+                         source_name_escaped = escape_markdown_v2(source_info['name'])
+
+                         status = source_statuses.get(source_filepath, "unknown")
+                         status_emoji = "🟢"
+                         if status == "disconnected":
+                             status_emoji = "🔴"
+                         elif status == "file_not_found":
+                             status_emoji = "❓"
+                         elif status == "unknown":
+                              status_emoji = "⚪"
+
+                         status_line = f">      {status_emoji} *{source_name_escaped}* ⟵ `{mode}: {escape_markdown_v2(str(value))}`" # استفاده از تورفتگی به جای └──
+                         status_lines.append(status_line)
+                    else:
+                         status_lines.append(f">      ❓ *منبع نامعتبر ({escape_markdown_v2(source_id)})*") # استفاده از تورفتگی
+
             if i < len(copies) - 1:
                 status_lines.append(">")
     return "\n".join(status_lines)
+
+
+
+
 
 def load_ecosystem(application: Application) -> bool:
     """Load ecosystem data from JSON file into bot_data for caching."""
@@ -158,6 +213,8 @@ def load_ecosystem(application: Application) -> bool:
         logger.error("Ecosystem load failed", extra={'status': 'failure', 'error': str(e)})
         return False
 
+
+
 def save_ecosystem(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Save cached ecosystem data to JSON file using atomic write."""
     if 'ecosystem' not in context.bot_data:
@@ -176,12 +233,39 @@ def save_ecosystem(context: ContextTypes.DEFAULT_TYPE) -> bool:
             os.remove(tmp_path)
         return False
 
+
+
+
+def load_source_statuses() -> dict:
+    if not os.path.exists(SOURCE_STATUS_PATH):
+        logger.debug(f"Source status file not found at {SOURCE_STATUS_PATH}")
+        return {}
+    try:
+        with open(SOURCE_STATUS_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            logger.warning(f"Invalid format in source status file: {SOURCE_STATUS_PATH}. Expected a dictionary.")
+            return {}
+        return data
+    except json.JSONDecodeError as e:
+        logger.warning(f"Error decoding JSON from source status file: {e}")
+        return {}
+    except Exception as e:
+        logger.error(f"Failed to load source status file: {e}")
+        return {}
+
+
+
+
+
 def backup_ecosystem():
     """Create a backup of ecosystem.json before modifications."""
     if os.path.exists(ECOSYSTEM_PATH):
         backup_path = ECOSYSTEM_PATH + ".bak." + datetime.now().strftime('%Y%m%d%H%M%S')
         os.rename(ECOSYSTEM_PATH, backup_path)
         logger.info("Ecosystem backed up", extra={'status': 'success', 'entity_id': backup_path})
+
+
 
 async def regenerate_all_configs(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Regenerate all configuration files for sources and copy accounts."""
@@ -288,9 +372,13 @@ async def regenerate_copy_settings_config(copy_id: str, context: ContextTypes.DE
             os.remove(tmp_path)
         return False
 
+
+
 def is_user_allowed(user_id: int) -> bool:
     """Check if user is allowed to access the bot."""
     return user_id in ALLOWED_USERS
+
+
 
 def allowed_users_only(func):
     """Decorator to log user actions and restrict access."""
@@ -331,9 +419,13 @@ def allowed_users_only(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
+
+
 def is_admin(user_id: int) -> bool:
     """Check if user is admin."""
     return user_id == ADMIN_ID
+
+
 
 def admin_only(func):
     """Decorator to restrict access to admin only."""
@@ -351,11 +443,15 @@ def admin_only(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
+
+
+
 @allowed_users_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Display main menu and system status."""
     keyboard = [
         [InlineKeyboardButton("📊 وضعیت", callback_data="status")],
+        [InlineKeyboardButton("📊 آمار", callback_data="statistics_menu")], # <-- دکمه جدید اضافه شد
         [InlineKeyboardButton("🛡️ حساب‌های کپی", callback_data="menu_copy_settings")],
         [InlineKeyboardButton("📊 منابع", callback_data="sources:main")],
         [InlineKeyboardButton("🔗 اتصالات", callback_data="menu_connections")],
@@ -365,7 +461,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reply_markup = InlineKeyboardMarkup(keyboard)
     status_text = await get_detailed_status_text(context)
     if update.callback_query:
-        await update.callback_query.answer("✅ وضعیت به‌روز شد")
+        # برای جلوگیری از خطای "Message is not modified" در هنگام رفرش وضعیت
+        if update.callback_query.data == "status":
+             await update.callback_query.answer("✅ وضعیت به‌روز شد")
+
         try:
             await update.callback_query.edit_message_text(
                 status_text,
@@ -374,13 +473,222 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except BadRequest as e:
             if "Message is not modified" not in str(e):
-                raise
+                logger.warning(f"Failed to edit message on status refresh: {e}") # لاگ هشدار به جای exception
+            # else: message not modified, ignore
     else:
         await update.message.reply_text(
             status_text,
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN_V2
         )
+
+
+
+
+
+# --- نیازمند import های جدید در ابتدای فایل ---
+from datetime import datetime, timedelta
+# ---
+
+@allowed_users_only
+async def handle_statistics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    منوی آمار با قابلیت فیلتر زمانی را نمایش داده و آمار معاملات را
+    از پایگاه داده خوانده و به کاربر نمایش می‌دهد.
+    """
+    query = update.callback_query
+    await query.answer() # اول answer بدهیم تا کاربر منتظر نماند
+    user_id = update.effective_user.id
+    data = query.data
+    log_extra = {'user_id': user_id, 'callback_data': data}
+
+    time_filter = "all" # پیش‌فرض: کل زمان
+    if data.startswith("stats:"):
+        time_filter = data.split(":")[1]
+
+    # --- نمایش منوی انتخاب بازه زمانی ---
+    if time_filter == "menu": # اگر callback_data فقط statistics_menu بود
+        keyboard = [
+            [InlineKeyboardButton("📊 آمار کل زمان", callback_data="stats:all")],
+            [InlineKeyboardButton("📊 آمار امروز", callback_data="stats:today")],
+            [InlineKeyboardButton("📊 آمار ۷ روز اخیر", callback_data="stats:7d")],
+            [InlineKeyboardButton("📊 آمار ۳۰ روز اخیر", callback_data="stats:30d")],
+            [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        try:
+             await query.edit_message_text(
+                 "لطفاً بازه زمانی مورد نظر برای نمایش آمار را انتخاب کنید:",
+                 reply_markup=reply_markup,
+                 parse_mode=ParseMode.MARKDOWN_V2
+             )
+             logger.debug("Statistics time filter menu displayed.", extra=log_extra)
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                 logger.warning(f"Failed to edit message for stats menu: {e}")
+        return # پایان کار، منتظر انتخاب کاربر می‌مانیم
+
+    # --- اگر بازه زمانی انتخاب شده بود، آمار را محاسبه و نمایش بده ---
+    await query.edit_message_text("⏳ در حال محاسبه آمار برای بازه انتخابی\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2) # پیام انتظار جدید
+
+    start_date_str = None
+    end_date_str = None
+    title = "📊 آمار کل معاملات" # عنوان پیش‌فرض
+
+    now = datetime.now()
+    if time_filter == "today":
+        start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_date = start_date + timedelta(days=1)
+        start_date_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
+        end_date_str = end_date.strftime('%Y-%m-%d %H:%M:%S')
+        title = "📊 آمار معاملات امروز"
+    elif time_filter == "7d":
+        start_date = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_date = now # تا لحظه حال
+        start_date_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
+        end_date_str = end_date.strftime('%Y-%m-%d %H:%M:%S')
+        title = "📊 آمار معاملات ۷ روز اخیر"
+    elif time_filter == "30d":
+        start_date = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_date = now # تا لحظه حال
+        start_date_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
+        end_date_str = end_date.strftime('%Y-%m-%d %H:%M:%S')
+        title = "📊 آمار معاملات ۳۰ روز اخیر"
+    # else: time_filter == "all", title پیش‌فرض باقی می‌ماند و start/end date هم None
+
+    try:
+        # ۱. خواندن اطلاعات نام‌ها (بدون تغییر)
+        ecosystem = context.bot_data.get('ecosystem', {})
+        source_name_lookup = {s['id']: s['name'] for s in ecosystem.get('sources', []) if 'id' in s} # اضافه کردن if 'id' in s
+        copy_name_lookup = {c['id']: c['name'] for c in ecosystem.get('copies', []) if 'id' in c} # اضافه کردن if 'id' in c
+
+        # ۲. اتصال به دیتابیس و اجرای کوئری (با شرط WHERE)
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        sql = '''
+            SELECT copy_id, source_id, SUM(profit) as total_profit, COUNT(*) as trade_count
+            FROM trades
+        '''
+        params = []
+        if start_date_str and end_date_str:
+            sql += " WHERE timestamp BETWEEN ? AND ?"
+            params.extend([start_date_str, end_date_str])
+
+        sql += '''
+            GROUP BY copy_id, source_id
+            ORDER BY copy_id, source_id
+        '''
+
+        cursor.execute(sql, params)
+        results = cursor.fetchall()
+        conn.close()
+
+        # ۳. پردازش نتایج و ساخت پیام (بدون تغییر عمده)
+        if not results:
+            await query.edit_message_text(
+                f"{title}\n\nهنوز هیچ داده‌ای برای نمایش در این بازه زمانی وجود ندارد\\.",
+                # --- تغییر: بازگشت به منوی انتخاب بازه ---
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="statistics_menu")]]),
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            return
+
+        stats_by_copy = {}
+        grand_total_profit = 0
+        grand_total_trades = 0
+
+        for row in results:
+            copy_id, source_id, total_profit, trade_count = row
+            grand_total_profit += total_profit
+            grand_total_trades += trade_count
+
+            if copy_id not in stats_by_copy:
+                stats_by_copy[copy_id] = {'total_profit': 0, 'total_trades': 0, 'sources': []}
+
+            stats_by_copy[copy_id]['total_profit'] += total_profit
+            stats_by_copy[copy_id]['total_trades'] += trade_count
+            stats_by_copy[copy_id]['sources'].append({
+                'source_id': source_id,
+                'profit': total_profit,
+                'trades': trade_count
+                # 'source_file' دیگر در کوئری نیست، اگر لازم شد باید اضافه شود
+            })
+
+        # ۴. فرمت‌بندی پیام خروجی (با عنوان جدید)
+        message_lines = [f"*{title}*"] # استفاده از عنوان داینامیک
+        message_lines.append(f"> *مجموع سود/زیان:* `{escape_markdown_v2(f'{grand_total_profit:,.2f}')}`")
+        message_lines.append(f"> *تعداد معاملات:* `{escape_markdown_v2(grand_total_trades)}`")
+        message_lines.append("> \n> ─── *جزئیات بر اساس حساب کپی* ───\n>")
+
+        for copy_id, data in stats_by_copy.items():
+            copy_name = escape_markdown_v2(copy_name_lookup.get(copy_id, copy_id))
+            message_lines.append(f"🛡️ *حساب:* {copy_name}")
+            message_lines.append(f">  ▫️ *مجموع سود/زیان:* `{escape_markdown_v2(f'{data['total_profit']:,.2f}')}`")
+            message_lines.append(f">  ▫️ *تعداد معاملات:* `{escape_markdown_v2(data['total_trades'])}`")
+            message_lines.append(">  ▫️ *تفکیک منابع:*")
+            if not data['sources']:
+                 message_lines.append(">       └── *بدون معامله ثبت شده*")
+            else:
+                for source_stat in data['sources']:
+                    source_name = "ناشناس یا حذف شده" # متن پیش‌فرض بهبود یافته
+                    if source_stat['source_id']:
+                        source_name = escape_markdown_v2(source_name_lookup.get(source_stat['source_id'], f"ID: {source_stat['source_id']}"))
+
+                    profit_str = escape_markdown_v2(f"{source_stat['profit']:,.2f}")
+                    trades_str = escape_markdown_v2(source_stat['trades'])
+                    message_lines.append(f">       └── *{source_name}:* سود/زیان: `{profit_str}`, تعداد: `{trades_str}`")
+            message_lines.append(">") # خط خالی
+
+        final_message = "\n".join(message_lines)
+
+        # ۵. ارسال پیام به تلگرام (با دکمه‌های جدید)
+        # --- تغییر: دکمه به‌روزرسانی با فیلتر فعلی و بازگشت به منوی انتخاب بازه ---
+        keyboard = [
+             [InlineKeyboardButton("🔄 به‌روزرسانی", callback_data=f"stats:{time_filter}")], # callback_data داینامیک شد
+             [InlineKeyboardButton("🔙 بازگشت به انتخاب بازه", callback_data="statistics_menu")] # بازگشت به منوی قبلی
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        try:
+             await query.edit_message_text(
+                 text=final_message,
+                 reply_markup=reply_markup,
+                 parse_mode=ParseMode.MARKDOWN_V2
+             )
+             log_extra['status'] = 'success'
+             logger.info(f"Statistics displayed successfully for filter: {time_filter}.", extra=log_extra)
+        except BadRequest as e:
+             if "message is too long" in str(e).lower():
+                  logger.warning(f"Statistics message too long for filter {time_filter}, sending truncated.", extra={**log_extra, 'status': 'truncated'})
+                  await query.edit_message_text(
+                       text=final_message[:4000] + "\n\n✂️... \\(پیام کامل نمایش داده نشد\\)",
+                       reply_markup=reply_markup,
+                       parse_mode=ParseMode.MARKDOWN_V2
+                  )
+             elif "Message is not modified" not in str(e):
+                  raise
+             # else: پیام تغییری نکرده، رد شو
+
+    # ... (بخش except ها مثل قبل) ...
+    except sqlite3.Error as e:
+        logger.error("Database error while fetching statistics.", extra={**log_extra, 'error': str(e), 'status': 'db_error'})
+        await query.edit_message_text(
+            "❌ خطایی در خواندن اطلاعات از پایگاه داده رخ داد\\.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="statistics_menu")]]), # بازگشت به منوی آمار
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+    except Exception as e:
+        logger.error("Unexpected error in handle_statistics_menu.", extra={**log_extra, 'error': str(e), 'status': 'failure'})
+        await notify_admin_on_error(context, "handle_statistics_menu", e, time_filter=time_filter) # اضافه کردن فیلتر به گزارش خطا
+        await query.edit_message_text(
+            "❌ یک خطای غیرمنتظره در نمایش آمار رخ داد\\. گزارش برای ادمین ارسال شد\\.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="statistics_menu")]]), # بازگشت به منوی آمار
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+
+
 
 @allowed_users_only
 async def clean_old_logs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1509,7 +1817,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(_handle_connections_menu, pattern="^menu_connections$|^conn:"))
     application.add_handler(CallbackQueryHandler(_handle_copy_settings_menu, pattern="^menu_copy_settings$|^setting:"))
     application.add_handler(CallbackQueryHandler(_handle_sources_menu, pattern="^sources:"))
-    
+    application.add_handler(CallbackQueryHandler(handle_statistics_menu, pattern="^statistics_menu$|^stats:"))
     # Message Handler for text input (must be one of the last)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     
