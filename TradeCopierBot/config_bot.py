@@ -283,56 +283,72 @@ async def regenerate_all_configs(context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 
+
+
 async def regenerate_copy_config(copy_id: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Regenerates the source configuration file (.cfg) for a specific copy account.
-    This final version robustly ensures the correct 5-column format to prevent parsing errors in the EA.
+    Ensures the correct 8-column format including security limits.
     """
     log_extra = {'entity_id': copy_id, 'status': 'starting'}
     logger.debug("Starting regeneration of copy config.", extra=log_extra)
-    
+
     ecosystem = context.bot_data.get('ecosystem', {})
     connections = ecosystem.get('mapping', {}).get(copy_id, [])
-    all_sources = {source['id']: source for source in ecosystem.get('sources', [])}
-    
-    content = ["# file_path,mode,allowed_symbols,volume_type,volume_value"]
-    
+    # all_sources نیاز به file_path دارد، پس ساختار آن را اصلاح می‌کنیم
+    all_sources = {source['id']: source for source in ecosystem.get('sources', []) if 'id' in source and 'file_path' in source}
+
+    # --- تغییر: اضافه کردن نام ستون‌های جدید به هدر ---
+    content = ["# file_path,mode,allowed_symbols,volume_type,volume_value,max_lot_size,max_concurrent_trades,source_drawdown_limit"]
+
     for conn in connections:
         source_id = conn.get('source_id')
         if source_id in all_sources:
             source_info = all_sources[source_id]
-            
+            file_path = source_info.get('file_path', 'UNKNOWN_FILE') # اطمینان از وجود file_path
+
             mode = conn.get('mode', 'ALL').upper()
-            
-            # اگر حالت SYMBOLS نبود، این فیلد باید خالی باشد اما همچنان وجود داشته باشد.
-            # این بخش کلیدی برای حل مشکل است.
             allowed_symbols = conn.get('allowed_symbols', '') if mode == 'SYMBOLS' else ''
-            
+
             volume_settings = conn.get('volume_settings', {})
-            
             if "FixedVolume" in volume_settings:
                 volume_type = "FIXED"
                 volume_value = volume_settings["FixedVolume"]
             else:
                 volume_type = "MULTIPLIER"
                 volume_value = volume_settings.get("Multiplier", 1.0)
-            
-            # ساختن خط با فرمت دقیق و صحیح 
-            # تمام ۵ متغیر در f-string پاس داده می‌شوند تا فرمت همیشه درست باشد.
-            line = f"{source_info['file_path']},{mode},{allowed_symbols},{volume_type},{volume_value}"
+
+            # --- جدید: خواندن مقادیر محدودیت‌ها از کانکشن ---
+            # اگر مقادیر در ecosystem.json تعریف نشده باشند، پیش‌فرض 0 استفاده می‌شود (بدون محدودیت)
+            max_lot_size = conn.get('max_lot_size', 0.0)
+            max_concurrent_trades = conn.get('max_concurrent_trades', 0)
+            source_drawdown_limit = conn.get('source_drawdown_limit', 0.0)
+            # --- پایان بخش جدید ---
+
+            # --- تغییر: ساختن خط با فرمت ۸ ستونی ---
+            line = (
+                f"{file_path},"
+                f"{mode},"
+                f"{allowed_symbols},"
+                f"{volume_type},"
+                f"{volume_value},"
+                f"{max_lot_size},"           # ستون ششم
+                f"{max_concurrent_trades}," # ستون هفتم
+                f"{source_drawdown_limit}"  # ستون هشتم
+            )
             content.append(line)
         else:
-            logger.warning(f"Source ID '{source_id}' in mapping not in sources list. Skipping.", extra=log_extra)
-            
-    cfg_path = os.path.join(os.path.dirname(ECOSYSTEM_PATH), f"{copy_id}_sources.cfg")
+            logger.warning(f"Source ID '{source_id}' found in mapping for copy '{copy_id}' but not defined in sources list. Skipping.", extra=log_extra)
+
+    cfg_path = os.path.join(os.path.dirname(ECOSYSTEM_PATH) if ECOSYSTEM_PATH else '.', f"{copy_id}_sources.cfg")
     tmp_path = cfg_path + ".tmp"
-    
+
     try:
         with open(tmp_path, 'w', encoding='utf-8') as f:
             f.write("\n".join(content))
         os.replace(tmp_path, cfg_path)
         log_extra['status'] = 'success'
-        logger.info("Successfully regenerated copy config file with correct format.", extra=log_extra)
+        logger.info(f"Successfully regenerated copy config file '{os.path.basename(cfg_path)}' with 8-column format.", extra=log_extra)
         return True
     except Exception as e:
         log_extra.update({'status': 'failure', 'error': str(e)})
@@ -341,6 +357,11 @@ async def regenerate_copy_config(copy_id: str, context: ContextTypes.DEFAULT_TYP
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         return False
+    
+
+
+
+
 
 
 async def regenerate_copy_settings_config(copy_id: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -900,25 +921,24 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 
+
+
+
+
 async def _display_connections_for_copy(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, copy_id: str):
-    """
-    Helper function to display the connections menu for a specific copy account.
-    This version is enhanced to show both the name and ID of sources for better clarity.
-    """
     ecosystem = context.bot_data.get('ecosystem', {})
     source_map = {s['id']: s for s in ecosystem.get('sources', [])}
     copy_account = next((c for c in ecosystem.get('copies', []) if c['id'] == copy_id), None)
-    
+
     if not copy_account:
         await query.edit_message_text("❌ حساب کپی مورد نظر یافت نشد\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
 
     connections = ecosystem.get('mapping', {}).get(copy_id, [])
     connected_source_ids = {conn['source_id'] for conn in connections}
-    
+
     keyboard = []
-    
-    # --- نمایش اتصالات موجود ---
+
     if not connections:
         keyboard.append([InlineKeyboardButton("این حساب به هیچ منبعی متصل نیست", callback_data="noop")])
     else:
@@ -929,47 +949,66 @@ async def _display_connections_for_copy(query: CallbackQuery, context: ContextTy
 
             source_name = escape_markdown_v2(source_map[source_id]['name'])
             source_id_escaped = escape_markdown_v2(source_id)
-            
-            # تیتر خوانا برای هر اتصال
-            header_text = f"───  اتصال به: {source_name} ({source_id_escaped}) ───"
+            header_text = f"─── اتصال به: {source_name} ({source_id_escaped}) ───"
             keyboard.append([InlineKeyboardButton(header_text, callback_data="noop")])
 
-            # دکمه تنظیمات حجم
+            # --- ردیف اول: حجم و حالت ---
             vs = conn.get('volume_settings', {})
             vol_mode = "Fixed" if "FixedVolume" in vs else "Multiplier"
             vol_value = vs.get("FixedVolume", vs.get("Multiplier", 1.0))
             volume_text = f"⚙️ حجم: {vol_mode} {vol_value}"
 
-            # دکمه حالت کپی
             copy_mode = conn.get('mode', 'ALL')
             mode_text = "🚦 حالت: "
-            if copy_mode == 'ALL':
-                mode_text += "همه نمادها"
-            elif copy_mode == 'GOLD_ONLY':
-                mode_text += "فقط طلا"
+            # ... (بقیه کد حالت کپی مثل قبل) ...
+            if copy_mode == 'ALL': mode_text += "همه نمادها"
+            elif copy_mode == 'GOLD_ONLY': mode_text += "فقط طلا"
             elif copy_mode == 'SYMBOLS':
                 symbols = conn.get('allowed_symbols', '')
                 short_symbols = symbols[:10] + '...' if len(symbols) > 10 else symbols
                 mode_text += f"خاص ({escape_markdown_v2(short_symbols) or 'خالی'})"
 
+
             keyboard.append([
                 InlineKeyboardButton(volume_text, callback_data=f"conn:set_volume_type:{copy_id}:{source_id}"),
-                InlineKeyboardButton(mode_text, callback_data=f"conn:set_mode_menu:{copy_id}:{source_id}"),
-                InlineKeyboardButton("✂️ قطع", callback_data=f"conn:disconnect:{copy_id}:{source_id}")
+                InlineKeyboardButton(mode_text, callback_data=f"conn:set_mode_menu:{copy_id}:{source_id}")
             ])
 
-    # --- نمایش منابع قابل اتصال ---
+            # --- ردیف دوم: محدودیت‌های امنیتی ---
+            max_lot = conn.get('max_lot_size', 0.0)
+            max_trades = conn.get('max_concurrent_trades', 0)
+            dd_limit = conn.get('source_drawdown_limit', 0.0)
+
+            max_lot_text = f"حداکثر لات: {'⛔' if max_lot <= 0 else escape_markdown_v2(f'{max_lot:.2f}')}"
+            max_trades_text = f"حداکثر معامله: {'⛔' if max_trades <= 0 else escape_markdown_v2(max_trades)}"
+            dd_limit_text = f"حد ضرر سورس ($): {'⛔' if dd_limit <= 0 else escape_markdown_v2(f'{dd_limit:.2f}')}"
+
+            keyboard.append([
+                InlineKeyboardButton(max_lot_text, callback_data=f"conn:set_limit:max_lot:{copy_id}:{source_id}"),
+                InlineKeyboardButton(max_trades_text, callback_data=f"conn:set_limit:max_trades:{copy_id}:{source_id}"),
+            ])
+            keyboard.append([
+                 InlineKeyboardButton(dd_limit_text, callback_data=f"conn:set_limit:dd_limit:{copy_id}:{source_id}")
+            ])
+            # --- پایان بخش جدید ---
+
+            # --- ردیف سوم: دکمه قطع اتصال ---
+            keyboard.append([
+                InlineKeyboardButton("✂️ قطع اتصال از این منبع", callback_data=f"conn:disconnect:{copy_id}:{source_id}")
+            ])
+
+
+    # --- نمایش منابع قابل اتصال (بدون تغییر) ---
     available_sources = [s for s_id, s in source_map.items() if s_id not in connected_source_ids]
     if available_sources:
         keyboard.append([InlineKeyboardButton("─" * 20, callback_data="noop")])
         keyboard.append([InlineKeyboardButton("🔽 اتصال به یک منبع جدید 🔽", callback_data="noop")])
         for source in available_sources:
-            # نمایش نام و شناسه برای منابع جدید
             connect_text = f"🔗 {escape_markdown_v2(source['name'])} ({escape_markdown_v2(source['id'])})"
             keyboard.append([InlineKeyboardButton(connect_text, callback_data=f"conn:connect:{copy_id}:{source['id']}")])
 
     keyboard.append([InlineKeyboardButton("🔙 بازگشت به لیست حساب‌ها", callback_data="menu_connections")])
-    
+
     try:
         await query.edit_message_text(
             f"مدیریت اتصالات حساب *{escape_markdown_v2(copy_account['name'])}*:",
@@ -978,16 +1017,10 @@ async def _display_connections_for_copy(query: CallbackQuery, context: ContextTy
         )
     except BadRequest as e:
         if "Message is not modified" not in str(e):
-            raise
-
-
-        
+            logger.error(f"Error editing connection menu: {e}") 
 
 @allowed_users_only
 async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles the main connections menu, including connect, disconnect, and mode selection actions.
-    """
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -997,8 +1030,11 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
     log_extra = {'user_id': user_id, 'callback_data': data, 'status': 'processing'}
 
     try:
+        action_part = parts[1] if len(parts) > 1 else None
+
         # --- نمایش منوی اصلی اتصالات ---
         if data == "menu_connections":
+            # ... (مثل قبل) ...
             context.user_data.clear()
             logger.debug("Navigating to main connections menu", extra=log_extra)
             keyboard = []
@@ -1010,26 +1046,33 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
             await query.edit_message_text("مدیریت اتصالات: یک حساب کپی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
             return
 
+
         # --- نمایش منوی یک حساب کپی خاص ---
-        if parts[1] == "select_copy":
+        if action_part == "select_copy":
             copy_id = parts[2]
-            context.user_data['selected_copy_id'] = copy_id
+            context.user_data['selected_copy_id'] = copy_id # ذخیره برای استفاده‌های بعدی
             await _display_connections_for_copy(query, context, copy_id)
             return
 
-        # --- مدیریت اتصال و قطع اتصال ---
-        if parts[1] in ["connect", "disconnect"]:
+        # --- مدیریت اتصال و قطع اتصال (با افزودن مقادیر پیش‌فرض محدودیت‌ها) ---
+        if action_part in ["connect", "disconnect"]:
             copy_id, source_id = parts[2], parts[3]
             log_extra.update({'copy_id': copy_id, 'source_id': source_id})
-            
-            if parts[1] == "connect":
+
+            if action_part == "connect":
                 logger.info("Connection process initiated", extra=log_extra)
-                # هنگام اتصال، یک کانفیگ پیش‌فرض با حالت ALL ایجاد می‌کنیم
+                # اضافه کردن مقادیر پیش‌فرض برای محدودیت‌ها (0 = غیرفعال)
                 ecosystem.setdefault('mapping', {}).setdefault(copy_id, []).append({
-                    'source_id': source_id, 'mode': 'ALL', 'allowed_symbols': '', 'volume_settings': {"Multiplier": 1.0}
+                    'source_id': source_id,
+                    'mode': 'ALL',
+                    'allowed_symbols': '',
+                    'volume_settings': {"Multiplier": 1.0},
+                    'max_lot_size': 0.0,
+                    'max_concurrent_trades': 0,
+                    'source_drawdown_limit': 0.0
                 })
                 feedback_text = "✅ اتصال با موفقیت برقرار شد"
-            else:  # disconnect
+            else: # disconnect
                 logger.info("Disconnection process initiated", extra=log_extra)
                 ecosystem['mapping'][copy_id] = [c for c in ecosystem['mapping'].get(copy_id, []) if c['source_id'] != source_id]
                 feedback_text = "✅ اتصال با موفقیت قطع شد"
@@ -1046,12 +1089,13 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
                 await query.answer("❌ خطا در ذخیره‌سازی تغییرات!")
             return
 
-        # --- نمایش منوی انتخاب حالت کپی (بخش جدید) ---
-        if parts[1] == "set_mode_menu":
+        # --- منوی انتخاب حالت کپی (بدون تغییر) ---
+        if action_part == "set_mode_menu":
             copy_id, source_id = parts[2], parts[3]
+            # ... (مثل قبل) ...
             log_extra.update({'copy_id': copy_id, 'source_id': source_id})
             logger.debug("Displaying copy mode selection menu", extra=log_extra)
-            
+
             keyboard = [
                 [InlineKeyboardButton("1️⃣ همه نمادها (All Symbols)", callback_data=f"conn:set_mode_action:ALL:{copy_id}:{source_id}")],
                 [InlineKeyboardButton("2️⃣ فقط طلا (Gold Only)", callback_data=f"conn:set_mode_action:GOLD_ONLY:{copy_id}:{source_id}")],
@@ -1065,45 +1109,70 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
             )
             return
 
-        # --- پردازش انتخاب حالت کپی (بخش جدید) ---
-        if parts[1] == "set_mode_action":
+        # --- پردازش انتخاب حالت کپی (بدون تغییر) ---
+        if action_part == "set_mode_action":
             mode, copy_id, source_id = parts[2], parts[3], parts[4]
+            # ... (مثل قبل) ...
             log_extra.update({'copy_id': copy_id, 'source_id': source_id, 'details': {'new_mode': mode}})
-
             connection = next((conn for conn in ecosystem.get('mapping', {}).get(copy_id, []) if conn['source_id'] == source_id), None)
-            if not connection:
-                await query.answer("❌ خطا: اتصال یافت نشد!", show_alert=True)
-                return
+            if not connection: await query.answer("❌ خطا: اتصال یافت نشد!", show_alert=True); return
 
             if mode == "SYMBOLS":
                 context.user_data['waiting_for'] = f"conn_symbols:{copy_id}:{source_id}"
                 log_extra['state_set'] = context.user_data['waiting_for']
                 logger.debug("Prompting user for allowed symbols list", extra=log_extra)
-                await query.edit_message_text(
-                    "لطفاً لیست نمادهای مجاز را وارد کنید\\. نمادها را با سمی‌کالن (;) از هم جدا کنید\\.\nمثال: `EURUSD;GBPUSD;XAUUSD`",
-                    parse_mode=ParseMode.MARKDOWN_V2
-                )
+                await query.edit_message_text("لطفاً لیست نمادهای مجاز را وارد کنید\\. نمادها را با سمی‌کالن (;) از هم جدا کنید\\.\nمثال: `EURUSD;GBPUSD;XAUUSD`", parse_mode=ParseMode.MARKDOWN_V2)
                 return
 
-            # برای ALL و GOLD_ONLY مستقیماً ذخیره می‌کنیم
             connection['mode'] = mode
             if save_ecosystem(context):
-                await regenerate_copy_config(copy_id, context)
-                await query.answer(f"✅ حالت کپی به '{mode}' تغییر کرد.")
-                log_extra['status'] = 'success'
-                logger.info("Connection copy mode updated.", extra=log_extra)
+                await regenerate_copy_config(copy_id, context); await query.answer(f"✅ حالت کپی به '{mode}' تغییر کرد.")
+                log_extra['status'] = 'success'; logger.info("Connection copy mode updated.", extra=log_extra)
                 await _display_connections_for_copy(query, context, copy_id)
             else:
-                log_extra['status'] = 'failure'
-                logger.error("Failed to save ecosystem after changing copy mode", extra=log_extra)
+                log_extra['status'] = 'failure'; logger.error("Failed to save ecosystem after changing copy mode", extra=log_extra)
                 await query.answer("❌ خطا در ذخیره‌سازی تغییرات!")
+            return
+
+
+        # --- جدید: مدیریت کلیک روی دکمه‌های تنظیم محدودیت ---
+        if action_part == "set_limit":
+            limit_type = parts[2] # 'max_lot', 'max_trades', 'dd_limit'
+            copy_id = parts[3]
+            source_id = parts[4]
+            context.user_data['waiting_for'] = f"conn_limit:{limit_type}:{copy_id}:{source_id}"
+            log_extra.update({'copy_id': copy_id, 'source_id': source_id, 'limit_type': limit_type, 'state_set': context.user_data['waiting_for']})
+            logger.debug(f"Prompting user for limit value: {limit_type}", extra=log_extra)
+
+            prompt_text = ""
+            example = ""
+            if limit_type == "max_lot":
+                prompt_text = "حداکثر حجم مجاز برای هر معامله از این سورس را وارد کنید \\(عدد بزرگتر از صفر\\)\\. برای غیرفعال کردن عدد 0 را وارد کنید\\."
+                example = "مثال: `1.5`"
+            elif limit_type == "max_trades":
+                prompt_text = "حداکثر تعداد معاملات باز همزمان از این سورس را وارد کنید \\(عدد صحیح بزرگتر از صفر\\)\\. برای غیرفعال کردن عدد 0 را وارد کنید\\."
+                example = "مثال: `3`"
+            elif limit_type == "dd_limit":
+                prompt_text = f"حد ضرر شناور برای *مجموع معاملات باز* این سورس را به واحد پولی حساب وارد کنید \\(عدد بزرگتر از صفر\\)\\. برای غیرفعال کردن عدد 0 را وارد کنید\\."
+                example = "مثال: `200.0`"
+
+            await query.edit_message_text(f"{prompt_text}\n{example}", parse_mode=ParseMode.MARKDOWN_V2)
             return
 
     except Exception as e:
         log_extra.update({'error': str(e), 'status': 'failure'})
         logger.critical("An unexpected exception occurred in the connections menu handler.", extra=log_extra)
         await notify_admin_on_error(context, "_handle_connections_menu", e, callback_data=data)
-        await query.message.reply_text("❌ یک خطای غیرمنتظره رخ داد\\. گزارش برای ادمین ارسال شد\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        try:
+             copy_id_from_context = context.user_data.get('selected_copy_id')
+             if copy_id_from_context:
+                  await _display_connections_for_copy(query, context, copy_id_from_context)
+             else:
+                  await query.edit_message_text("❌ یک خطای غیرمنتظره رخ داد\\. به منوی اصلی بازگردید\\.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")]]), parse_mode=ParseMode.MARKDOWN_V2)
+        except:
+             await query.message.reply_text("❌ یک خطای غیرمنتظره رخ داد\\. گزارش برای ادمین ارسال شد\\.", parse_mode=ParseMode.MARKDOWN_V2)
+
+
 
 
 
@@ -1570,55 +1639,147 @@ async def _process_conn_symbols(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("برای ادامه، به منوی اتصالات بازگردید:", reply_markup=InlineKeyboardMarkup(keyboard))
     return True
 
+
+async def _process_conn_limit_value(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
+    """Processes the numeric input for connection security limits."""
+    try:
+        # استخراج اطلاعات از waiting_for
+        _, limit_type, copy_id, source_id = context.user_data.get('waiting_for', ':::').split(':')
+    except ValueError:
+        logger.error("Invalid waiting_for format for conn_limit", extra=log_extra)
+        await update.message.reply_text("❌ خطای داخلی رخ داد\\. لطفا دوباره امتحان کنید.", parse_mode=ParseMode.MARKDOWN_V2)
+        return True # بازگشت به منوی اصلی
+
+    value = None
+    error_message = None
+    limit_key = None # کلید مورد استفاده در ecosystem.json
+    limit_name = "" # نام خوانا برای پیام‌ها
+
+    # اعتبارسنجی ورودی بر اساس نوع محدودیت
+    try:
+        if limit_type == "max_lot":
+            limit_key = "max_lot_size"
+            limit_name = "حداکثر حجم"
+            value = float(text)
+            if value < 0: raise ValueError("Value must be non-negative.")
+        elif limit_type == "max_trades":
+            limit_key = "max_concurrent_trades"
+            limit_name = "حداکثر معاملات همزمان"
+            value = int(text)
+            if value < 0: raise ValueError("Value must be non-negative.")
+        elif limit_type == "dd_limit":
+            limit_key = "source_drawdown_limit"
+            limit_name = "حد ضرر دلاری سورس"
+            value = float(text)
+            if value < 0: raise ValueError("Value must be non-negative.")
+        else:
+            error_message = "❌ نوع محدودیت نامعتبر است."
+
+    except ValueError:
+        if limit_type == "max_trades":
+             error_message = "❌ ورودی نامعتبر است\\. لطفاً یک عدد صحیح \\(مانند 3\\) یا 0 وارد کنید\\."
+        else:
+             error_message = "❌ ورودی نامعتبر است\\. لطفاً یک عدد \\(مانند 1\\.5 یا 200\\) یا 0 وارد کنید\\."
+
+    if error_message:
+        await update.message.reply_text(error_message, parse_mode=ParseMode.MARKDOWN_V2)
+        # کاربر باید دوباره تلاش کند، state پاک نمی‌شود
+        return False # به منوی اصلی برنگرد
+
+    # پیدا کردن اتصال مربوطه
+    connection = next((conn for conn in ecosystem.get('mapping', {}).get(copy_id, []) if conn['source_id'] == source_id), None)
+    if not connection:
+        await update.message.reply_text("❌ اتصال مورد نظر یافت نشد\\. لطفاً به منوی اصلی بازگردید.", parse_mode=ParseMode.MARKDOWN_V2)
+        return True # بازگشت به منوی اصلی
+
+    # ذخیره مقدار جدید در ecosystem
+    connection[limit_key] = value
+
+    if not save_ecosystem(context):
+        # بازگرداندن تغییر در صورت خطا در ذخیره
+        # (نیاز به خواندن مقدار قبلی داریم - فعلا از این بخش صرف‌نظر می‌کنیم)
+        await update.message.reply_text("❌ خطا در ذخیره‌سازی تنظیمات\\. لطفا دوباره امتحان کنید.", parse_mode=ParseMode.MARKDOWN_V2)
+        return False # به منوی اصلی برنگرد
+
+    # بازسازی فایل کانفیگ
+    await regenerate_copy_config(copy_id, context)
+
+    log_extra.update({'copy_id': copy_id, 'source_id': source_id, 'details': {'limit': limit_key, 'value': value}})
+    logger.info("Connection limit updated successfully", extra=log_extra)
+
+    status_text = "غیرفعال شد" if value <= 0 else f"روی `{escape_markdown_v2(value)}` تنظیم شد"
+    await update.message.reply_text(f"✅ *{escape_markdown_v2(limit_name)}* با موفقیت {status_text}\\.", parse_mode=ParseMode.MARKDOWN_V2)
+
+    # پاک کردن state انتظار
+    context.user_data.clear() # <- مهم: state را پاک می‌کنیم
+    logger.debug("State cleared after processing conn_limit.", extra=log_extra)
+
+
+    # نمایش مجدد منوی اتصالات (نیاز به query دارد - اینجا نداریم، دکمه بازگشت می‌گذاریم)
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت به اتصالات", callback_data=f"conn:select_copy:{copy_id}")]]
+    await update.message.reply_text("برای مشاهده تغییرات، به منوی اتصالات بازگردید:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    return False # به منوی اصلی برنگرد
+
+
 # --- Dispatcher Dictionary ---
 STATE_HANDLERS = {
     "source_add_smart_name": _process_source_smart_add,
     "source_edit_name": _process_source_edit_name,
     "copy_add_name": _process_copy_add_name,
 }
-
 # --- Main Text Input Handler ---
 @allowed_users_only
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     waiting_for = context.user_data.get('waiting_for')
     if not waiting_for:
-        return
+        return # اگر منتظر ورودی نیستیم، کاری نکن
 
     text = update.message.text.strip()
     ecosystem = context.bot_data.get('ecosystem', {})
     user_id = update.effective_user.id
     log_extra = {'user_id': user_id, 'state': waiting_for, 'text_received': text, 'status': 'processing'}
-    
-    handler = STATE_HANDLERS.get(waiting_for)
-    if not handler:
-        if waiting_for.startswith("copy_"):
-            handler = _process_copy_setting_value
-        elif waiting_for.startswith("conn_volume:"):
-            handler = _process_conn_volume_value
-        elif waiting_for.startswith("conn_symbols:"): # <-- بخش جدید
-            handler = _process_conn_symbols
 
-    should_return_to_main_menu = False
+    handler = None # پیش‌فرض: هیچ پردازشگری پیدا نشد
+
+    # پیدا کردن پردازشگر مناسب بر اساس state
+    if waiting_for in STATE_HANDLERS:
+        handler = STATE_HANDLERS[waiting_for]
+    elif waiting_for.startswith("copy_"):
+        handler = _process_copy_setting_value
+    elif waiting_for.startswith("conn_volume:"):
+        handler = _process_conn_volume_value
+    elif waiting_for.startswith("conn_symbols:"):
+        handler = _process_conn_symbols
+    # --- جدید: شرط برای پردازش مقادیر محدودیت ---
+    elif waiting_for.startswith("conn_limit:"):
+        handler = _process_conn_limit_value
+
+
+    should_clear_state = False # آیا باید state پاک شود؟ (پیش‌فرض نه)
     try:
         if handler:
-            should_return_to_main_menu = await handler(update, context, text, ecosystem=ecosystem, log_extra=log_extra)
+            # تابع پردازشگر خودش مشخص می‌کند که آیا state باید پاک شود یا نه
+            # اگر True برگرداند یعنی کار تمام شده و state پاک شود
+            # اگر False برگرداند یعنی کاربر باید دوباره تلاش کند و state باقی بماند
+            should_clear_state = await handler(update, context, text, ecosystem=ecosystem, log_extra=log_extra)
         else:
+            # اگر state تنظیم شده بود ولی handler پیدا نشد (نباید اتفاق بیفتد)
             logger.warning("No handler found for an active 'waiting_for' state. Clearing state.", extra=log_extra)
-            should_return_to_main_menu = True
+            should_clear_state = True # state را پاک کن تا کاربر گیر نکند
+
     except (KeyError, IOError, Exception) as e:
         error_message = f"❌ یک خطای غیرمنتظره در پردازش ورودی رخ داد\\."
         await update.message.reply_text(error_message, parse_mode=ParseMode.MARKDOWN_V2)
         log_extra.update({'error': str(e), 'status': 'failure'})
         logger.error("An exception occurred during text input processing.", extra=log_extra)
         await notify_admin_on_error(context, "handle_text_input", e, waiting_for=waiting_for)
-        should_return_to_main_menu = True
+        should_clear_state = True # در صورت خطا، state را پاک کن
     finally:
-        if should_return_to_main_menu:
+        if should_clear_state:
             context.user_data.clear()
-            logger.debug("State cleared after text input processing.", extra={'user_id': user_id})
-            # به جای فراخوانی start، به کاربر اجازه می‌دهیم خودش با دکمه‌ها ادامه دهد
-            # این کار از ارسال پیام‌های ناخواسته جلوگیری می‌کند.
-
+            logger.debug("State cleared after text input processing.", extra={'user_id': user_id, 'state_cleared_for': waiting_for})
+            # دیگر نیازی به بازگشت خودکار به منوی اصلی نیست، پیام‌های راهنما کافی هستند
 
 
 

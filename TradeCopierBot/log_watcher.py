@@ -319,26 +319,28 @@ async def send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, message: str):
             logger.critical("An unexpected error occurred in send_telegram_alert.", extra={'error': str(e)})
             return
             
-# --- پایان بخش ارسال اعلان ---
 
 
 
 # --- فاز ۲، بخش اول: تجزیه لاگ با Regex (Robust Parsing) ---
-
-# --- تغییر: الگوهای Regex برای فرمت جدید لاگ‌ها ---
-# مثال OPEN: copy_A,XAUUSD,0.11 (Source:0.11,Mult:1.00),2345.71000,178661555,TradeCopier_S2.txt,1234567
 open_pattern = re.compile(r'\[TRADE_OPEN\]\s+([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),(\d+)')
-# مثال CLOSE: copy_A,XAUUSD,178662307,-5.06,TradeCopier_S2.txt,1234567
 close_pattern = re.compile(r'\[TRADE_CLOSE\]\s+([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),(\d+)')
-alert_pattern = re.compile(r'\[DD_ALERT\]\s+(.*)') # بدون تغییر
-stop_pattern = re.compile(r'\[DD_STOP\]\s+(.*)')   # بدون تغییر
-error_pattern = re.compile(r'\[ERROR\]\s+-\s+(.*)') # بدون تغییر
+alert_pattern = re.compile(r'\[DD_ALERT\]\s+(.*)')
+stop_pattern = re.compile(r'\[DD_STOP\]\s+(.*)')   
+error_pattern = re.compile(r'\[ERROR\]\s+-\s+(.*)') 
+
+# مثال LIMIT_MAX_LOT: copy_A,TradeCopier_S1.txt,0.50,0.10
+limit_max_lot_pattern = re.compile(r'\[LIMIT_MAX_LOT\]\s+([^,]+),([^,]+),([^,]+),([^,]+)')
+
+# مثال LIMIT_MAX_TRADES: copy_A,TradeCopier_S1.txt,3,3
+limit_max_trades_pattern = re.compile(r'\[LIMIT_MAX_TRADES\]\s+([^,]+),([^,]+),(\d+),(\d+)')
+
+# مثال LIMIT_SOURCE_DD: copy_A,TradeCopier_S1.txt,-215.50,200.00,3
+limit_source_dd_pattern = re.compile(r'\[LIMIT_SOURCE_DD\]\s+([^,]+),([^,]+),([^,]+),([^,]+),(\d+)')
+
 
 def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
-    """
-    یک خط لاگ را با استفاده از Regex تجزیه، به پیام تلگرام تبدیل کرده
-    و در صورت لزوم، دیکشنری داده برای ذخیره در DB را برمی‌گرداند.
-    """
+
     line = line.strip()
     if not line:
         return None, None
@@ -347,119 +349,115 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
     trade_data_for_db = None
 
     try:
-        # --- پردازش لاگ TRADE_OPEN (با فرمت جدید ۷ فیلدی) ---
+        # --- پردازش لاگ TRADE_OPEN ---
         if match := open_pattern.search(line):
             parts = [p.strip() for p in match.groups()]
-            if len(parts) != 7:
-                 raise ValueError(f"Invalid OPEN format: expected 7 parts, got {len(parts)}")
-
+            if len(parts) != 7: raise ValueError(f"Invalid OPEN format: {len(parts)} parts")
             copy_id, symbol, volume_info, price, source_ticket_str, source_file, source_account_number_str = parts
             source_account_number = int(source_account_number_str)
-
-            # استخراج نام خوانا از مپ جدید
             source_info = source_name_map.get(source_file)
             source_display_name = source_info['name'] if source_info else source_file
-
-            # --- اصلاح: فقط آپدیت state در اینجا، حذف در save_trade_to_db ---
             global state_data, state_changed
-            if state_data.get(source_ticket_str) != source_display_name: # کلید state باید رشته باشد
-                state_data[source_ticket_str] = source_display_name
-                state_changed = True
-            # --- پایان اصلاح ---
-
+            if state_data.get(source_ticket_str) != source_display_name:
+                state_data[source_ticket_str] = source_display_name; state_changed = True
             formatted_message = (
                 f"✅ *New Position Opened*\n\n"
-                f"*Source:* `{source_display_name}` (Acc: `{source_account_number}`)\n" # شماره اکانت اضافه شد
-                f"*Copy Account:* `{copy_id}`\n"
-                f"*Symbol:* `{symbol}`\n"
-                f"*Volume:* `{volume_info}`\n"
-                f"*Open Price:* `{price}`\n"
+                f"*Source:* `{source_display_name}` (Acc: `{source_account_number}`)\n"
+                f"*Copy Account:* `{copy_id}`\n*Symbol:* `{symbol}`\n"
+                f"*Volume:* `{volume_info}`\n*Open Price:* `{price}`\n"
                 f"*Source Ticket:* `{source_ticket_str}`"
             )
 
-        # --- پردازش لاگ TRADE_CLOSE (با فرمت جدید ۶ فیلدی) ---
+        # --- پردازش لاگ TRADE_CLOSE ---
         elif match := close_pattern.search(line):
             parts = [p.strip() for p in match.groups()]
-            if len(parts) != 6:
-                raise ValueError(f"Invalid CLOSE format: expected 6 parts, got {len(parts)}")
-
+            if len(parts) != 6: raise ValueError(f"Invalid CLOSE format: {len(parts)} parts")
             copy_id, symbol, source_ticket_str, profit_str, source_file, source_account_number_str = parts
-            profit = float(profit_str)
-            source_account_number = int(source_account_number_str)
-
-            # --- اصلاح: خواندن نام منبع از state ---
-            source_display_name = state_data.get(source_ticket_str, source_file) # اگر در state نبود از نام فایل استفاده کن
-            # --- پایان اصلاح ---
-
+            profit = float(profit_str); source_account_number = int(source_account_number_str)
+            source_display_name = state_data.get(source_ticket_str, source_file)
             profit_text = f"+${profit:,.2f}" if profit >= 0 else f"-${abs(profit):,.2f}"
             emoji = "☑️" if profit >= 0 else "🔻"
-
             formatted_message = (
                 f"{emoji} *Position Closed*\n\n"
-                f"*Source:* `{source_display_name}` (Acc: `{source_account_number}`)\n" # شماره اکانت اضافه شد
-                f"*Copy Account:* `{copy_id}`\n"
-                f"*Symbol:* `{symbol}`\n"
-                f"*Profit/Loss:* `{profit_text}`\n"
-                f"*Source Ticket:* `{source_ticket_str}`"
+                f"*Source:* `{source_display_name}` (Acc: `{source_account_number}`)\n"
+                f"*Copy Account:* `{copy_id}`\n*Symbol:* `{symbol}`\n"
+                f"*Profit/Loss:* `{profit_text}`\n*Source Ticket:* `{source_ticket_str}`"
             )
-
-            # --- جدید: آماده‌سازی داده برای ذخیره در دیتابیس ---
             trade_data_for_db = {
-                'copy_id': copy_id,
-                'symbol': symbol,
-                'profit': profit,
-                'source_file': source_file,
-                'source_account_number': source_account_number,
-                'source_ticket': source_ticket_str # تیکت برای حذف از state لازم است
+                'copy_id': copy_id, 'symbol': symbol, 'profit': profit,
+                'source_file': source_file, 'source_account_number': source_account_number,
+                'source_ticket': source_ticket_str
             }
-            # --- پایان بخش جدید ---
 
-        # --- پردازش لاگ‌های DD_ALERT, DD_STOP, ERROR (بدون تغییر عمده) ---
+        # --- پردازش لاگ‌های DD_ALERT, DD_STOP, ERROR (بدون تغییر) ---
         elif match := alert_pattern.search(line):
-             parts = [p.strip() for p in match.group(1).split(',')]
-             if len(parts) != 5:
-                raise ValueError(f"Invalid ALERT format: expected 5 parts, got {len(parts)}")
+             parts = [p.strip() for p in match.group(1).split(',')];
+             if len(parts) != 5: raise ValueError(f"Invalid ALERT format: {len(parts)} parts")
              copy_id, dd, dollar_loss, start_equity, peak_equity = parts
-             formatted_message = (
-                f"🟡 *Daily Drawdown Alert*\n\n"
-                f"*Account:* `{copy_id}`\n"
-                f"*Current Loss:* `%{float(dd):.2f}` `(-${float(dollar_loss):,.2f})`\n"
-                f"*Daily Start Equity:* `${float(start_equity):,.2f}`\n"
-                f"*Daily Peak Equity:* `${float(peak_equity):,.2f}`"
-             )
-
-
+             formatted_message = (f"🟡 *Daily Drawdown Alert*\n\n*Account:* `{copy_id}`\n"
+                                f"*Current Loss:* `%{float(dd):.2f}` `(-${float(dollar_loss):,.2f})`\n"
+                                f"*Daily Start Equity:* `${float(start_equity):,.2f}`\n*Daily Peak Equity:* `${float(peak_equity):,.2f}`")
         elif match := stop_pattern.search(line):
-             parts = [p.strip() for p in match.group(1).split(',')]
-             if len(parts) != 6:
-                raise ValueError(f"Invalid STOP format: expected 6 parts, got {len(parts)}")
+             parts = [p.strip() for p in match.group(1).split(',')];
+             if len(parts) != 6: raise ValueError(f"Invalid STOP format: {len(parts)} parts")
              copy_id, dd, dd_limit, dollar_loss, start_equity, peak_equity = parts
-             formatted_message = (
-                f"🔴 *Copy Stopped Due to DD Limit*\n\n"
-                f"*Account:* `{copy_id}`\n"
-                f"*Loss at Stop:* `%{float(dd):.2f}` `(-${float(dollar_loss):,.2f})`\n"
-                f"*Stop Threshold:* `%{float(dd_limit):,.2f}`"
-             )
-
+             formatted_message = (f"🔴 *Copy Stopped Due to DD Limit*\n\n*Account:* `{copy_id}`\n"
+                                f"*Loss at Stop:* `%{float(dd):.2f}` `(-${float(dollar_loss):,.2f})`\n"
+                                f"*Stop Threshold:* `%{float(dd_limit):,.2f}`")
         elif match := error_pattern.search(line):
              error_message = match.group(1).strip()
-             # ... (بقیه کد ERROR مثل قبل) ...
-             if "Failed to open source file" in error_message:
-                 logger.debug("Ignoring non-critical source file error.", extra={'details': error_message})
-                 return None, None # هیچ پیامی برنگردان
+             if "Failed to open source file" in error_message: return None, None
              formatted_message = f"🚨 *Expert Error*\n\n`{error_message}`"
+
+
+        # --- جدید: پردازش لاگ‌های محدودیت ---
+        elif match := limit_max_lot_pattern.search(line):
+            parts = [p.strip() for p in match.groups()]
+            if len(parts) != 4: raise ValueError(f"Invalid LIMIT_MAX_LOT format: {len(parts)} parts")
+            copy_id, source_file, source_vol_str, limit_vol_str = parts
+            source_info = source_name_map.get(source_file)
+            source_display_name = source_info['name'] if source_info else source_file
+            formatted_message = (
+                f"🚫 *Max Lot Size Limit*\n\n"
+                f"*Account:* `{copy_id}`\n"
+                f"*Source:* `{source_display_name}`\n"
+                f"*Details:* Trade volume `{source_vol_str}` exceeded limit `{limit_vol_str}`. Trade ignored."
+            )
+
+        elif match := limit_max_trades_pattern.search(line):
+            parts = [p.strip() for p in match.groups()]
+            if len(parts) != 4: raise ValueError(f"Invalid LIMIT_MAX_TRADES format: {len(parts)} parts")
+            copy_id, source_file, open_trades_str, limit_trades_str = parts
+            source_info = source_name_map.get(source_file)
+            source_display_name = source_info['name'] if source_info else source_file
+            formatted_message = (
+                f"🔢 *Max Concurrent Trades Limit*\n\n"
+                f"*Account:* `{copy_id}`\n"
+                f"*Source:* `{source_display_name}`\n"
+                f"*Details:* Limit of `{limit_trades_str}` open trades reached (`{open_trades_str}` currently open). New trade ignored."
+            )
+
+        elif match := limit_source_dd_pattern.search(line):
+            parts = [p.strip() for p in match.groups()]
+            if len(parts) != 5: raise ValueError(f"Invalid LIMIT_SOURCE_DD format: {len(parts)} parts")
+            copy_id, source_file, current_pl_str, limit_dd_str, closed_count_str = parts
+            source_info = source_name_map.get(source_file)
+            source_display_name = source_info['name'] if source_info else source_file
+            formatted_message = (
+                f"💣 *Source Drawdown Limit Hit*\n\n"
+                f"*Account:* `{copy_id}`\n"
+                f"*Source:* `{source_display_name}`\n"
+                f"*Details:* Floating P/L (`{current_pl_str}`) reached limit (`-{limit_dd_str}`). Closed `{closed_count_str}` position(s) from this source."
+            )
+        # --- پایان بخش جدید ---
 
 
     except (ValueError, IndexError, TypeError) as e:
         logger.warning(f"Malformed log line skipped: '{line}'. Error: {e}", extra={'status': 'parse_error', 'line': line})
         formatted_message = f"⚠️ *Parse Error in Log*\n`{line}`"
-        trade_data_for_db = None # در صورت خطا، داده‌ای ذخیره نشود
+        trade_data_for_db = None
 
     return formatted_message, trade_data_for_db
-# --- پایان بازنویسی ---
-
-# --- پایان بخش تجزیه لاگ ---
-
 
 
 
