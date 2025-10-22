@@ -322,8 +322,7 @@ async def send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, message: str):
 
 
 
-# --- فاز ۲، بخش اول: تجزیه لاگ با Regex (Robust Parsing) ---
-open_pattern = re.compile(r'\[TRADE_OPEN\]\s+([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),(\d+)')
+open_pattern = re.compile(r'\[TRADE_OPEN\]\s+([^,]+),([^,]+),(.+?),([^,]+),([^,]+),([^,]+),(\d+)')
 close_pattern = re.compile(r'\[TRADE_CLOSE\]\s+([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),(\d+)')
 alert_pattern = re.compile(r'\[DD_ALERT\]\s+(.*)')
 stop_pattern = re.compile(r'\[DD_STOP\]\s+(.*)')   

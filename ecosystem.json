@@ -11,20 +11,26 @@
       "name": "رضا",
       "file_path": "TradeCopier_S2.txt",
       "config_file": "source_2_config.txt"
+    },
+    {
+      "id": "source_3",
+      "name": "Seyed",
+      "file_path": "TradeCopier_S3.txt",
+      "config_file": "source_3_config.txt"
     }
   ],
   "copies": [
     {
-      "id": "copy_1",
+      "id": "copy_A",
       "name": "کپی 1",
       "settings": {
-         "DailyDrawdownPercent": 5.0, 
-         "AlertDrawdownPercent": 4.0
+        "DailyDrawdownPercent": 0,
+        "AlertDrawdownPercent": 4.0
       }
     }
   ],
   "mapping": {
-    "copy_1": [
+    "copy_A": [
       {
         "source_id": "source_1",
         "mode": "ALL",
@@ -32,9 +38,9 @@
         "volume_settings": {
           "Multiplier": 2.0
         },
-        "max_lot_size": 1.0,       
-        "max_concurrent_trades": 3,  
-        "source_drawdown_limit": 200.0 
+        "max_lot_size": 1.0,
+        "max_concurrent_trades": 3,
+        "source_drawdown_limit": 200.0
       },
       {
         "source_id": "source_2",
@@ -44,7 +50,7 @@
           "FixedVolume": 0.1
         },
         "max_lot_size": 0.0,
-        "max_concurrent_trades": 5,  
+        "max_concurrent_trades": 5,
         "source_drawdown_limit": 0.0
       }
     ]
