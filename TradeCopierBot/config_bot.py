@@ -12,10 +12,8 @@ import glob
 from telegram.constants import ParseMode
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
-
-
-
-
+import aiosqlite
+import asyncio
 
 
 class JsonFormatter(logging.Formatter):
@@ -507,28 +505,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
-# --- نیازمند import های جدید در ابتدای فایل ---
-from datetime import datetime, timedelta
-# ---
 
 @allowed_users_only
 async def handle_statistics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    منوی آمار با قابلیت فیلتر زمانی را نمایش داده و آمار معاملات را
-    از پایگاه داده خوانده و به کاربر نمایش می‌دهد.
-    """
     query = update.callback_query
-    await query.answer() # اول answer بدهیم تا کاربر منتظر نماند
+    await query.answer()
     user_id = update.effective_user.id
     data = query.data
     log_extra = {'user_id': user_id, 'callback_data': data}
 
-    time_filter = "all" # پیش‌فرض: کل زمان
-    if data.startswith("stats:"):
-        time_filter = data.split(":")[1]
+    time_filter = "all"
 
-    # --- نمایش منوی انتخاب بازه زمانی ---
-    if time_filter == "menu": # اگر callback_data فقط statistics_menu بود
+    if data == "statistics_menu":
         keyboard = [
             [InlineKeyboardButton("📊 آمار کل زمان", callback_data="stats:all")],
             [InlineKeyboardButton("📊 آمار امروز", callback_data="stats:today")],
@@ -538,23 +526,28 @@ async def handle_statistics_menu(update: Update, context: ContextTypes.DEFAULT_T
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         try:
-             await query.edit_message_text(
-                 "لطفاً بازه زمانی مورد نظر برای نمایش آمار را انتخاب کنید:",
-                 reply_markup=reply_markup,
-                 parse_mode=ParseMode.MARKDOWN_V2
-             )
-             logger.debug("Statistics time filter menu displayed.", extra=log_extra)
+            await query.edit_message_text(
+                "لطفاً بازه زمانی مورد نظر برای نمایش آمار را انتخاب کنید:",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            logger.info("Statistics time filter menu displayed.", extra=log_extra)
         except BadRequest as e:
             if "Message is not modified" not in str(e):
-                 logger.warning(f"Failed to edit message for stats menu: {e}")
-        return # پایان کار، منتظر انتخاب کاربر می‌مانیم
+                logger.warning(f"Failed to edit message for stats menu: {e}", extra=log_extra)
+        return
 
-    # --- اگر بازه زمانی انتخاب شده بود، آمار را محاسبه و نمایش بده ---
-    await query.edit_message_text("⏳ در حال محاسبه آمار برای بازه انتخابی\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2) # پیام انتظار جدید
+    if data.startswith("stats:"):
+        time_filter = data.split(":")[1]
+    
+    await query.edit_message_text("⏳ در حال محاسبه آمار برای بازه انتخابی\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+
+    log_extra['time_filter'] = time_filter
+    logger.info(f"Generating statistics for filter: {time_filter}", extra=log_extra)
 
     start_date_str = None
     end_date_str = None
-    title = "📊 آمار کل معاملات" # عنوان پیش‌فرض
+    title = "📊 آمار کل معاملات"
 
     now = datetime.now()
     if time_filter == "today":
@@ -565,27 +558,31 @@ async def handle_statistics_menu(update: Update, context: ContextTypes.DEFAULT_T
         title = "📊 آمار معاملات امروز"
     elif time_filter == "7d":
         start_date = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
-        end_date = now # تا لحظه حال
+        end_date = now
         start_date_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
         end_date_str = end_date.strftime('%Y-%m-%d %H:%M:%S')
         title = "📊 آمار معاملات ۷ روز اخیر"
     elif time_filter == "30d":
         start_date = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
-        end_date = now # تا لحظه حال
+        end_date = now
         start_date_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
         end_date_str = end_date.strftime('%Y-%m-%d %H:%M:%S')
         title = "📊 آمار معاملات ۳۰ روز اخیر"
-    # else: time_filter == "all", title پیش‌فرض باقی می‌ماند و start/end date هم None
 
     try:
-        # ۱. خواندن اطلاعات نام‌ها (بدون تغییر)
+        db_conn = context.bot_data.get('db_conn')
+        if not db_conn:
+            logger.error("DB connection not found in bot_data. Statistics unavailable.", extra=log_extra)
+            await query.edit_message_text(
+                "❌ خطای بحرانی: اتصال به دیتابیس آمار برقرار نیست\\. لطفاً به ادمین اطلاع دهید\\.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="statistics_menu")]]),
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            return
+            
         ecosystem = context.bot_data.get('ecosystem', {})
-        source_name_lookup = {s['id']: s['name'] for s in ecosystem.get('sources', []) if 'id' in s} # اضافه کردن if 'id' in s
-        copy_name_lookup = {c['id']: c['name'] for c in ecosystem.get('copies', []) if 'id' in c} # اضافه کردن if 'id' in c
-
-        # ۲. اتصال به دیتابیس و اجرای کوئری (با شرط WHERE)
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        source_name_lookup = {s['id']: s['name'] for s in ecosystem.get('sources', []) if 'id' in s}
+        copy_name_lookup = {c['id']: c['name'] for c in ecosystem.get('copies', []) if 'id' in c}
 
         sql = '''
             SELECT copy_id, source_id, SUM(profit) as total_profit, COUNT(*) as trade_count
@@ -601,15 +598,13 @@ async def handle_statistics_menu(update: Update, context: ContextTypes.DEFAULT_T
             ORDER BY copy_id, source_id
         '''
 
-        cursor.execute(sql, params)
-        results = cursor.fetchall()
-        conn.close()
+        results = []
+        async with db_conn.execute(sql, params) as cursor:
+            results = await cursor.fetchall()
 
-        # ۳. پردازش نتایج و ساخت پیام (بدون تغییر عمده)
         if not results:
             await query.edit_message_text(
                 f"{title}\n\nهنوز هیچ داده‌ای برای نمایش در این بازه زمانی وجود ندارد\\.",
-                # --- تغییر: بازگشت به منوی انتخاب بازه ---
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="statistics_menu")]]),
                 parse_mode=ParseMode.MARKDOWN_V2
             )
@@ -633,11 +628,9 @@ async def handle_statistics_menu(update: Update, context: ContextTypes.DEFAULT_T
                 'source_id': source_id,
                 'profit': total_profit,
                 'trades': trade_count
-                # 'source_file' دیگر در کوئری نیست، اگر لازم شد باید اضافه شود
             })
 
-        # ۴. فرمت‌بندی پیام خروجی (با عنوان جدید)
-        message_lines = [f"*{title}*"] # استفاده از عنوان داینامیک
+        message_lines = [f"*{title}*"]
         message_lines.append(f"> *مجموع سود/زیان:* `{escape_markdown_v2(f'{grand_total_profit:,.2f}')}`")
         message_lines.append(f"> *تعداد معاملات:* `{escape_markdown_v2(grand_total_trades)}`")
         message_lines.append("> \n> ─── *جزئیات بر اساس حساب کپی* ───\n>")
@@ -645,29 +638,27 @@ async def handle_statistics_menu(update: Update, context: ContextTypes.DEFAULT_T
         for copy_id, data in stats_by_copy.items():
             copy_name = escape_markdown_v2(copy_name_lookup.get(copy_id, copy_id))
             message_lines.append(f"🛡️ *حساب:* {copy_name}")
-            message_lines.append(f">  ▫️ *مجموع سود/زیان:* `{escape_markdown_v2(f'{data['total_profit']:,.2f}')}`")
-            message_lines.append(f">  ▫️ *تعداد معاملات:* `{escape_markdown_v2(data['total_trades'])}`")
+            message_lines.append(f">  ▫️ *مجموع سود/زیان:* `{escape_markdown_v2(f'{data["total_profit"]:,.2f}')}`")
+            message_lines.append(f">  ▫️ *تعداد معاملات:* `{escape_markdown_v2(data["total_trades"])}`")
             message_lines.append(">  ▫️ *تفکیک منابع:*")
             if not data['sources']:
                  message_lines.append(">       └── *بدون معامله ثبت شده*")
             else:
                 for source_stat in data['sources']:
-                    source_name = "ناشناس یا حذف شده" # متن پیش‌فرض بهبود یافته
+                    source_name = "ناشناس یا حذف شده"
                     if source_stat['source_id']:
                         source_name = escape_markdown_v2(source_name_lookup.get(source_stat['source_id'], f"ID: {source_stat['source_id']}"))
 
                     profit_str = escape_markdown_v2(f"{source_stat['profit']:,.2f}")
                     trades_str = escape_markdown_v2(source_stat['trades'])
                     message_lines.append(f">       └── *{source_name}:* سود/زیان: `{profit_str}`, تعداد: `{trades_str}`")
-            message_lines.append(">") # خط خالی
+            message_lines.append(">") 
 
         final_message = "\n".join(message_lines)
 
-        # ۵. ارسال پیام به تلگرام (با دکمه‌های جدید)
-        # --- تغییر: دکمه به‌روزرسانی با فیلتر فعلی و بازگشت به منوی انتخاب بازه ---
         keyboard = [
-             [InlineKeyboardButton("🔄 به‌روزرسانی", callback_data=f"stats:{time_filter}")], # callback_data داینامیک شد
-             [InlineKeyboardButton("🔙 بازگشت به انتخاب بازه", callback_data="statistics_menu")] # بازگشت به منوی قبلی
+             [InlineKeyboardButton("🔄 به‌روزرسانی", callback_data=f"stats:{time_filter}")],
+             [InlineKeyboardButton("🔙 بازگشت به انتخاب بازه", callback_data="statistics_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -678,7 +669,7 @@ async def handle_statistics_menu(update: Update, context: ContextTypes.DEFAULT_T
                  parse_mode=ParseMode.MARKDOWN_V2
              )
              log_extra['status'] = 'success'
-             logger.info(f"Statistics displayed successfully for filter: {time_filter}.", extra=log_extra)
+             logger.info(f"Statistics displayed successfully for filter: {time_filter}, {len(results)} rows.", extra=log_extra)
         except BadRequest as e:
              if "message is too long" in str(e).lower():
                   logger.warning(f"Statistics message too long for filter {time_filter}, sending truncated.", extra={**log_extra, 'status': 'truncated'})
@@ -689,24 +680,24 @@ async def handle_statistics_menu(update: Update, context: ContextTypes.DEFAULT_T
                   )
              elif "Message is not modified" not in str(e):
                   raise
-             # else: پیام تغییری نکرده، رد شو
-
-    # ... (بخش except ها مثل قبل) ...
-    except sqlite3.Error as e:
-        logger.error("Database error while fetching statistics.", extra={**log_extra, 'error': str(e), 'status': 'db_error'})
+        
+    except (aiosqlite.Error, sqlite3.Error) as e:
+        logger.error(f"Database error while fetching statistics: {e}", extra={**log_extra, 'error': str(e), 'status': 'db_error'})
         await query.edit_message_text(
             "❌ خطایی در خواندن اطلاعات از پایگاه داده رخ داد\\.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="statistics_menu")]]), # بازگشت به منوی آمار
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="statistics_menu")]]),
             parse_mode=ParseMode.MARKDOWN_V2
         )
     except Exception as e:
-        logger.error("Unexpected error in handle_statistics_menu.", extra={**log_extra, 'error': str(e), 'status': 'failure'})
-        await notify_admin_on_error(context, "handle_statistics_menu", e, time_filter=time_filter) # اضافه کردن فیلتر به گزارش خطا
+        logger.error(f"Unexpected error in handle_statistics_menu: {e}", extra={**log_extra, 'error': str(e), 'status': 'failure'})
+        await notify_admin_on_error(context, "handle_statistics_menu", e, time_filter=time_filter)
         await query.edit_message_text(
             "❌ یک خطای غیرمنتظره در نمایش آمار رخ داد\\. گزارش برای ادمین ارسال شد\\.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="statistics_menu")]]), # بازگشت به منوی آمار
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="statistics_menu")]]),
             parse_mode=ParseMode.MARKDOWN_V2
         )
+
+
 
 
 
@@ -894,34 +885,73 @@ async def regenerate_all_files_handler(update: Update, context: ContextTypes.DEF
 
 
 
-
 @allowed_users_only
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display help menu with bot usage instructions."""
+    """
+    (بازنویسی شده)
+    منوی راهنما را با فرمت صحیح MarkdownV2 و لاگ‌گیری نمایش می‌دهد.
+    """
+    # این تابع متن راهنما را نمایش می‌دهد
+    
+    user = update.effective_user
+    log_extra = {'user_id': user.id}
+    
+    # --- متن اصلاح شده برای MARKDOWN_V2 ---
+    # کاراکترهای رزرو شده مانند '.' و '-' باید 'escape' شوند (با '\').
     help_text = (
         "📖 *راهنمای ربات*\n\n"
         "مدیریت آسان کپی معاملات:\n\n"
         "*دستورات:*\n"
-        "▫️ `/start` - منوی اصلی و وضعیت سیستم.\n"
-        "▫️ `/getlog [copy_id]` - دریافت لاگ حساب (مثال: `/getlog copy_A`).\n"
-        "▫️ `/clean_old_logs` - حذف لاگ‌های قدیمی.\n\n"
+        "▫️ `/start` \- منوی اصلی و وضعیت سیستم\\.\n"
+        "▫️ `/getlog [copy_id]` \- دریافت لاگ حساب (مثال: `/getlog copy_A`)\\.\n"
+        "▫️ `/clean_old_logs` \- حذف لاگ‌های قدیمی\\.\n\n"
         "*منوها:*\n"
-        "🔹 *وضعیت:* نمایش وضعیت حساب‌ها و اتصالات.\n"
-        "🔹 *حساب‌های کپی:* افزودن/حذف و تنظیم ریسک.\n"
-        "🔹 *منابع:* مدیریت حساب‌های منبع.\n"
-        "🔹 *اتصالات:* تنظیم اتصال منابع به حساب‌ها.\n"
-        "🔹 *بازسازی فایل‌ها:* بازسازی تنظیمات."
+        "🔹 *وضعیت:* نمایش وضعیت حساب‌ها و اتصالات\\.\n"
+        "🔹 *حساب‌های کپی:* افزودن/حذف و تنظیم ریسک\\.\n"
+        "🔹 *منابع:* مدیریت حساب‌های منبع\\.\n"
+        "🔹 *اتصالات:* تنظیم اتصال منابع به حساب‌ها\\.\n"
+        "🔹 *بازسازی فایل‌ها:* بازسازی تنظیمات\\."
     )
-    if update.callback_query:
-        await update.callback_query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")]
-        ]), parse_mode=ParseMode.MARKDOWN_V2)
-    else:
-        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN_V2)
+    
+    reply_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")]
+    ])
 
+    try:
+        if update.callback_query:
+            # اگر از دکمه آمده، پیام را ویرایش کن
+            await update.callback_query.edit_message_text(
+                help_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            log_extra['action'] = 'edit'
+        else:
+            # اگر با دستوری مانند /help فراخوانی شود (برای آینده)
+            await update.message.reply_text(
+                help_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            log_extra['action'] = 'reply'
+            
+        logger.info("Help menu displayed.", extra=log_extra)
 
-
-
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            # اگر کاربر چند بار روی دکمه کلیک کند، این خطا طبیعی است
+            logger.debug("Help menu not modified (already displayed).", extra=log_extra)
+            await update.callback_query.answer() # به تلگرام می‌گوییم که کلیک را دریافت کردیم
+        else:
+            # خطای دیگری در تلگرام
+            log_extra.update({'error': str(e), 'status': 'failure'})
+            logger.error("Telegram BadRequest while sending help menu.", extra=log_extra)
+    except Exception as e:
+        # خطای ناشناخته
+        log_extra.update({'error': str(e), 'status': 'failure'})
+        logger.error("Unexpected error in help_handler.", extra=log_extra)
+        # به ادمین اطلاع بده
+        await notify_admin_on_error(context, "help_handler", e)
 
 
 
@@ -1472,13 +1502,12 @@ async def _handle_sources_menu(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 
-
 # ==============================================================================
 #  TEXT INPUT HANDLER & PROCESSORS (REFACTORED)
 # ==============================================================================
 
 async def _process_source_smart_add(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
-    """Processes the display name to smartly create a new source."""
+    # این تابع یک سورس جدید با نام هوشمند ایجاد می‌کند
     if not text:
         await update.message.reply_text("❌ نام نمی‌تواند خالی باشد\\. لطفاً یک نام معتبر وارد کنید:", parse_mode=ParseMode.MARKDOWN_V2)
         return False
@@ -1514,103 +1543,137 @@ async def _process_source_smart_add(update: Update, context: ContextTypes.DEFAUL
         f"▫️ شناسه: `{escape_markdown_v2(new_source['id'])}`\n"
         f"▫️ فایل مسیر: `{escape_markdown_v2(new_source['file_path'])}`"
     )
-    await update.message.reply_text(success_message, parse_mode=ParseMode.MARKDOWN_V2)
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت به لیست منابع", callback_data="sources:main")]]
+    await update.message.reply_text(success_message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     return True
 
 async def _process_source_edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
+    # این تابع نام یک سورس موجود را ویرایش می‌کند
     if not text:
         await update.message.reply_text("❌ نام نمی‌تواند خالی باشد\\. لطفاً یک نام معتبر وارد کنید:", parse_mode=ParseMode.MARKDOWN_V2)
         return False
+        
     source_id = context.user_data.get('selected_source_id')
     if not source_id:
-        raise KeyError("'selected_source_id' not found in user_data. Please re-select the source.")
+        raise KeyError("'selected_source_id' not found in user_data")
+        
     source_to_edit = next((s for s in ecosystem.get('sources', []) if s['id'] == source_id), None)
     if not source_to_edit:
         await update.message.reply_text("❌ منبع مورد نظر یافت نشد\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return True
+        
     old_name = source_to_edit['name']
     source_to_edit['name'] = text
+    
     if not save_ecosystem(context):
-        source_to_edit['name'] = old_name # Rollback change on failure
+        source_to_edit['name'] = old_name
         raise IOError("Failed to save ecosystem after editing source name")
+        
     log_extra.update({'entity_id': source_id, 'details': {'from': old_name, 'to': text}})
     logger.info("Source name updated successfully", extra=log_extra)
-    await update.message.reply_text("✅ نام منبع با موفقیت تغییر کرد\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت به لیست منابع", callback_data="sources:main")]]
+    await update.message.reply_text("✅ نام منبع با موفقیت تغییر کرد\\.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     return True
 
 async def _process_copy_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
+    # این تابع نام حساب کپی جدید را پردازش می‌کند
     if not text:
         await update.message.reply_text("❌ نام نمی‌تواند خالی باشد\\. لطفاً یک نام معتبر وارد کنید:", parse_mode=ParseMode.MARKDOWN_V2)
         return False
+        
     copy_id = context.user_data['temp_copy_id']
     new_copy = {'id': copy_id, 'name': text, 'settings': {"DailyDrawdownPercent": 5.0, "AlertDrawdownPercent": 4.0}}
+    
     ecosystem.setdefault('copies', []).append(new_copy)
     ecosystem.setdefault('mapping', {})[copy_id] = []
+    
     if not save_ecosystem(context):
         raise IOError("Failed to save ecosystem after adding copy account")
+        
     await regenerate_copy_settings_config(copy_id, context)
     await regenerate_copy_config(copy_id, context)
+    
     log_extra['entity_id'] = copy_id
     logger.info("New copy account added successfully", extra=log_extra)
-    await update.message.reply_text(f"✅ حساب کپی *{escape_markdown_v2(text)}* با موفقیت افزوده شد\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت به لیست حساب‌ها", callback_data="menu_copy_settings")]]
+    await update.message.reply_text(f"✅ حساب کپی *{escape_markdown_v2(text)}* با موفقیت افزوده شد\\.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     return True
 
 async def _process_copy_setting_value(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
+    # این تابع مقادیر تنظیمات حساب کپی (مانند DD) را پردازش می‌کند
     waiting_for = context.user_data.get('waiting_for', '')
     setting_key = waiting_for.replace("copy_", "")
     copy_id = context.user_data.get('selected_copy_id')
+    
     if not copy_id:
-        raise KeyError("'selected_copy_id' not found. Please re-select the copy account.")
+        raise KeyError("'selected_copy_id' not found")
+        
     try:
         value = float(text)
         if value < 0: raise ValueError("Value cannot be negative.")
     except ValueError:
         await update.message.reply_text("❌ ورودی نامعتبر است\\. لطفاً یک عدد مثبت وارد کنید \\(مثال: 4\\.5\\)\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return False
+        
     copy_account = next((c for c in ecosystem.get('copies', []) if c['id'] == copy_id), None)
     if copy_account:
         copy_account.setdefault('settings', {})[setting_key] = value
         if not save_ecosystem(context):
             raise IOError(f"Failed to save ecosystem after updating {setting_key}")
+            
         await regenerate_copy_settings_config(copy_id, context)
+        
         log_extra.update({'entity_id': copy_id, 'details': {'setting': setting_key, 'value': value}})
         logger.info("Copy setting updated successfully", extra=log_extra)
-        await update.message.reply_text(f"✅ مقدار *{escape_markdown_v2(setting_key)}* با موفقیت به‌روزرسانی شد\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        
+        keyboard = [[InlineKeyboardButton("🔙 بازگشت به تنظیمات حساب", callback_data=f"setting:select:{copy_id}")]]
+        await update.message.reply_text(f"✅ مقدار *{escape_markdown_v2(setting_key)}* با موفقیت به‌روزرسانی شد\\.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     else:
         await update.message.reply_text("❌ حساب کپی مورد نظر یافت نشد\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        
     return True
 
 async def _process_conn_volume_value(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
+    # (بازنویسی شده) - این تابع مقدار حجم اتصال را پردازش می‌کند
     _, vol_type, copy_id, source_id = context.user_data.get('waiting_for', ':::').split(':')
+    
     try:
         value = float(text)
         if value <= 0: raise ValueError("Value must be a positive number.")
     except ValueError:
         await update.message.reply_text("❌ ورودی نامعتبر است\\. لطفاً یک عدد بزرگتر از صفر وارد کنید\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return False
+        
     connection = next((conn for conn in ecosystem.get('mapping', {}).get(copy_id, []) if conn['source_id'] == source_id), None)
     if not connection:
         await update.message.reply_text("❌ اتصال مورد نظر یافت نشد\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return True
+        
     volume_key = "Multiplier" if vol_type == "mult" else "FixedVolume"
     connection['volume_settings'] = {volume_key: value}
+    
     if not save_ecosystem(context):
         raise IOError("Failed to save ecosystem after updating volume settings")
+        
     await regenerate_copy_config(copy_id, context)
+    
     log_extra.update({'copy_id': copy_id, 'source_id': source_id, 'details': {'type': vol_type, 'value': value}})
     logger.info("Connection volume updated successfully", extra=log_extra)
-    await update.message.reply_text("✅ حجم اتصال با موفقیت تنظیم شد\\.", parse_mode=ParseMode.MARKDOWN_V2)
-    await _display_connections_for_copy(update.callback_query or update.message, context, copy_id)
+    
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت به اتصالات", callback_data=f"conn:select_copy:{copy_id}")]]
+    await update.message.reply_text("✅ حجم اتصال با موفقیت تنظیم شد\\.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     return True
 
 async def _process_conn_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
-    """Processes the list of allowed symbols for a connection."""
+    # (بازنویسی شده) - این تابع لیست نمادهای مجاز را پردازش می‌کند
     _, copy_id, source_id = context.user_data.get('waiting_for', '::').split(':')
+    
     if not text:
         await update.message.reply_text("❌ لیست نمادها نمی‌تواند خالی باشد\\. لطفاً حداقل یک نماد وارد کنید\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return False
 
-    # پاک‌سازی و فرمت‌بندی ورودی
     symbols = [s.strip().upper() for s in text.split(';') if s.strip()]
     if not symbols:
         await update.message.reply_text("❌ فرمت ورودی نامعتبر است\\. لطفاً نمادها را با سمی‌کالن جدا کنید\\.", parse_mode=ParseMode.MARKDOWN_V2)
@@ -1630,32 +1693,30 @@ async def _process_conn_symbols(update: Update, context: ContextTypes.DEFAULT_TY
         raise IOError("Failed to save ecosystem after updating allowed symbols")
     
     await regenerate_copy_config(copy_id, context)
+    
     log_extra.update({'copy_id': copy_id, 'source_id': source_id, 'details': {'mode': 'SYMBOLS', 'symbols': formatted_symbols}})
     logger.info("Connection allowed symbols updated successfully", extra=log_extra)
-    await update.message.reply_text(f"✅ حالت کپی به 'نمادهای خاص' با لیست زیر تغییر کرد:\n`{escape_markdown_v2(formatted_symbols)}`", parse_mode=ParseMode.MARKDOWN_V2)
     
-    # برای بازگشت به منو، نیاز به یک query داریم. چون در اینجا نداریم، به کاربر پیام می‌دهیم.
+    message = f"✅ حالت کپی به 'نمادهای خاص' با لیست زیر تغییر کرد:\n`{escape_markdown_v2(formatted_symbols)}`"
     keyboard = [[InlineKeyboardButton("🔙 بازگشت به اتصالات", callback_data=f"conn:select_copy:{copy_id}")]]
-    await update.message.reply_text("برای ادامه، به منوی اتصالات بازگردید:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     return True
 
 
 async def _process_conn_limit_value(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, ecosystem: dict, log_extra: dict):
-    """Processes the numeric input for connection security limits."""
+    # (بازنویسی شده) - این تابع مقادیر محدودیت‌های امنیتی را پردازش می‌کند
     try:
-        # استخراج اطلاعات از waiting_for
         _, limit_type, copy_id, source_id = context.user_data.get('waiting_for', ':::').split(':')
     except ValueError:
-        logger.error("Invalid waiting_for format for conn_limit", extra=log_extra)
+        logger.error("Invalid waiting_for format for conn_limit", extra={**log_extra, 'status': 'failure'})
         await update.message.reply_text("❌ خطای داخلی رخ داد\\. لطفا دوباره امتحان کنید.", parse_mode=ParseMode.MARKDOWN_V2)
-        return True # بازگشت به منوی اصلی
+        return True
 
     value = None
     error_message = None
-    limit_key = None # کلید مورد استفاده در ecosystem.json
-    limit_name = "" # نام خوانا برای پیام‌ها
+    limit_key = None
+    limit_name = ""
 
-    # اعتبارسنجی ورودی بر اساس نوع محدودیت
     try:
         if limit_type == "max_lot":
             limit_key = "max_lot_size"
@@ -1683,90 +1744,71 @@ async def _process_conn_limit_value(update: Update, context: ContextTypes.DEFAUL
 
     if error_message:
         await update.message.reply_text(error_message, parse_mode=ParseMode.MARKDOWN_V2)
-        # کاربر باید دوباره تلاش کند، state پاک نمی‌شود
-        return False # به منوی اصلی برنگرد
+        return False
 
-    # پیدا کردن اتصال مربوطه
     connection = next((conn for conn in ecosystem.get('mapping', {}).get(copy_id, []) if conn['source_id'] == source_id), None)
     if not connection:
         await update.message.reply_text("❌ اتصال مورد نظر یافت نشد\\. لطفاً به منوی اصلی بازگردید.", parse_mode=ParseMode.MARKDOWN_V2)
-        return True # بازگشت به منوی اصلی
+        return True
 
-    # ذخیره مقدار جدید در ecosystem
     connection[limit_key] = value
 
     if not save_ecosystem(context):
-        # بازگرداندن تغییر در صورت خطا در ذخیره
-        # (نیاز به خواندن مقدار قبلی داریم - فعلا از این بخش صرف‌نظر می‌کنیم)
         await update.message.reply_text("❌ خطا در ذخیره‌سازی تنظیمات\\. لطفا دوباره امتحان کنید.", parse_mode=ParseMode.MARKDOWN_V2)
-        return False # به منوی اصلی برنگرد
+        return False
 
-    # بازسازی فایل کانفیگ
     await regenerate_copy_config(copy_id, context)
 
     log_extra.update({'copy_id': copy_id, 'source_id': source_id, 'details': {'limit': limit_key, 'value': value}})
     logger.info("Connection limit updated successfully", extra=log_extra)
 
     status_text = "غیرفعال شد" if value <= 0 else f"روی `{escape_markdown_v2(value)}` تنظیم شد"
-    await update.message.reply_text(f"✅ *{escape_markdown_v2(limit_name)}* با موفقیت {status_text}\\.", parse_mode=ParseMode.MARKDOWN_V2)
-
-    # پاک کردن state انتظار
-    context.user_data.clear() # <- مهم: state را پاک می‌کنیم
-    logger.debug("State cleared after processing conn_limit.", extra=log_extra)
-
-
-    # نمایش مجدد منوی اتصالات (نیاز به query دارد - اینجا نداریم، دکمه بازگشت می‌گذاریم)
+    message = f"✅ *{escape_markdown_v2(limit_name)}* با موفقیت {status_text}\\."
     keyboard = [[InlineKeyboardButton("🔙 بازگشت به اتصالات", callback_data=f"conn:select_copy:{copy_id}")]]
-    await update.message.reply_text("برای مشاهده تغییرات، به منوی اتصالات بازگردید:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
+    
+    return True
 
-    return False # به منوی اصلی برنگرد
 
-
-# --- Dispatcher Dictionary ---
+# --- نقشه توابع پردازشگر ---
 STATE_HANDLERS = {
     "source_add_smart_name": _process_source_smart_add,
     "source_edit_name": _process_source_edit_name,
     "copy_add_name": _process_copy_add_name,
+    "conn_symbols": _process_conn_symbols, # 'conn_symbols:' دیگر prefix نیست
 }
-# --- Main Text Input Handler ---
+
 @allowed_users_only
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # (بازنویسی شده) - این تابع اصلی، ورودی متنی را مدیریت می‌کند
     waiting_for = context.user_data.get('waiting_for')
     if not waiting_for:
-        return # اگر منتظر ورودی نیستیم، کاری نکن
+        return
 
     text = update.message.text.strip()
     ecosystem = context.bot_data.get('ecosystem', {})
     user_id = update.effective_user.id
     log_extra = {'user_id': user_id, 'state': waiting_for, 'text_received': text, 'status': 'processing'}
 
-    handler = None # پیش‌فرض: هیچ پردازشگری پیدا نشد
+    handler = None
+    should_clear_state = False
 
-    # پیدا کردن پردازشگر مناسب بر اساس state
-    if waiting_for in STATE_HANDLERS:
-        handler = STATE_HANDLERS[waiting_for]
-    elif waiting_for.startswith("copy_"):
-        handler = _process_copy_setting_value
-    elif waiting_for.startswith("conn_volume:"):
-        handler = _process_conn_volume_value
-    elif waiting_for.startswith("conn_symbols:"):
-        handler = _process_conn_symbols
-    # --- جدید: شرط برای پردازش مقادیر محدودیت ---
-    elif waiting_for.startswith("conn_limit:"):
-        handler = _process_conn_limit_value
-
-
-    should_clear_state = False # آیا باید state پاک شود؟ (پیش‌فرض نه)
     try:
-        if handler:
-            # تابع پردازشگر خودش مشخص می‌کند که آیا state باید پاک شود یا نه
-            # اگر True برگرداند یعنی کار تمام شده و state پاک شود
-            # اگر False برگرداند یعنی کاربر باید دوباره تلاش کند و state باقی بماند
-            should_clear_state = await handler(update, context, text, ecosystem=ecosystem, log_extra=log_extra)
+        if waiting_for in STATE_HANDLERS:
+            handler = STATE_HANDLERS[waiting_for]
+        elif waiting_for.startswith("copy_"):
+            handler = _process_copy_setting_value
+        elif waiting_for.startswith("conn_volume:"):
+            handler = _process_conn_volume_value
+        elif waiting_for.startswith("conn_limit:"):
+            handler = _process_conn_limit_value
         else:
-            # اگر state تنظیم شده بود ولی handler پیدا نشد (نباید اتفاق بیفتد)
-            logger.warning("No handler found for an active 'waiting_for' state. Clearing state.", extra=log_extra)
-            should_clear_state = True # state را پاک کن تا کاربر گیر نکند
+            logger.warning("No handler found for an active 'waiting_for' state.", extra=log_extra)
+            should_clear_state = True # استیت نامعتبر را پاک کن
+            return
+
+        if handler:
+            should_clear_state = await handler(update, context, text, ecosystem=ecosystem, log_extra=log_extra)
 
     except (KeyError, IOError, Exception) as e:
         error_message = f"❌ یک خطای غیرمنتظره در پردازش ورودی رخ داد\\."
@@ -1774,12 +1816,12 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         log_extra.update({'error': str(e), 'status': 'failure'})
         logger.error("An exception occurred during text input processing.", extra=log_extra)
         await notify_admin_on_error(context, "handle_text_input", e, waiting_for=waiting_for)
-        should_clear_state = True # در صورت خطا، state را پاک کن
+        should_clear_state = True
     finally:
         if should_clear_state:
             context.user_data.clear()
             logger.debug("State cleared after text input processing.", extra={'user_id': user_id, 'state_cleared_for': waiting_for})
-            # دیگر نیازی به بازگشت خودکار به منوی اصلی نیست، پیام‌های راهنما کافی هستند
+
 
 
 
@@ -1935,42 +1977,51 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
-
-def main() -> None:
-    """Initialize and run the bot."""
+async def main() -> None:
     if not all([BOT_TOKEN, ECOSYSTEM_PATH, ALLOWED_USERS, LOG_DIRECTORY_PATH]):
         logger.critical("Missing critical environment variables", extra={'status': 'failure'})
         return
         
+    db_conn = None
+    try:
+        db_conn = await aiosqlite.connect(DB_PATH)
+        logger.info(f"Async DB connection established.", extra={'status': 'success', 'entity_id': DB_PATH})
+
+        async with db_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trades'") as cursor:
+            if await cursor.fetchone() is None:
+                logger.critical("DB Health Check FAILED: 'trades' table not found.", extra={'entity_id': DB_PATH})
+                logger.critical(f"Ensure log_watcher.py is running AND DB_PATH is identical: {DB_PATH}")
+            else:
+                logger.info("DB Health Check OK: 'trades' table found.", extra={'entity_id': DB_PATH})
+
+    except Exception as e:
+        logger.critical(f"Failed to connect to DB at startup. Statistics will be unavailable.", extra={'error': str(e), 'entity_id': DB_PATH})
+
     application = Application.builder().token(BOT_TOKEN).build()
+    
+    if db_conn:
+        application.bot_data['db_conn'] = db_conn
     
     if not load_ecosystem(application):
         logger.critical("Ecosystem load failed, stopping bot", extra={'status': 'failure'})
+        if db_conn:
+            await db_conn.close()
         return
-    
 
-# ✅ --- Scheduling the Automatic Job ---
     job_queue = application.job_queue
-    # محاسبه ۷ روز به ثانیه (7 * 24 * 60 * 60)
     seven_days_in_seconds = 604800
     job_queue.run_repeating(cleanup_job, interval=seven_days_in_seconds, name="weekly_backup_cleanup")
     
-
-    
-    # --- Handler Registrations ---
-    # Command Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("getlog", get_log_handler))
     application.add_handler(CommandHandler("clean_old_logs", clean_old_logs_handler))
     application.add_handler(CommandHandler("cleanbackups", clean_old_backups_handler))
 
-    
     application.add_handler(CallbackQueryHandler(
         callback_handler_for_text_input, 
         pattern="^setting_input_|^conn:set_volume_type:|^conn:set_volume_value:"
     ))
 
-    # General Menu Handlers
     application.add_handler(CallbackQueryHandler(start, pattern="^main_menu$"))
     application.add_handler(CallbackQueryHandler(start, pattern="^status$"))
     application.add_handler(CallbackQueryHandler(regenerate_all_files_handler, pattern="^regenerate_all_files$"))
@@ -1979,15 +2030,38 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(_handle_copy_settings_menu, pattern="^menu_copy_settings$|^setting:"))
     application.add_handler(CallbackQueryHandler(_handle_sources_menu, pattern="^sources:"))
     application.add_handler(CallbackQueryHandler(handle_statistics_menu, pattern="^statistics_menu$|^stats:"))
-    # Message Handler for text input (must be one of the last)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     
-    # Error handler (must be last)
     application.add_error_handler(error_handler)
     
-    logger.info("Bot started successfully", extra={'status': 'success'})
-    
-    # Run the bot
-    application.run_polling()
+    try:
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(drop_pending_updates=True)
+        logger.info("Bot started successfully (Polling Mode)")
+        await asyncio.Event().wait()
+        
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot shutting down (Interrupt)...")
+    except Exception as e:
+        logger.critical(f"Bot polling loop failed critically.", extra={'error': str(e), 'status': 'failure'})
+    finally:
+        logger.info("Starting graceful shutdown...")
+        if application.updater and application.updater.is_running:
+            await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+        
+        if db_conn:
+            await db_conn.close()
+            logger.info("Async DB connection closed.")
+        
+        logger.info("Bot shutdown complete.")
+
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot execution stopped by user (Ctrl+C).")
+    except Exception as e:
+        logger.critical(f"Fatal error in main execution", extra={'error': str(e), 'status': 'fatal'})

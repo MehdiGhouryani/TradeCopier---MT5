@@ -13,7 +13,7 @@ import json
 from logging.handlers import RotatingFileHandler
 import sqlite3
 import datetime # برای timestamp
-
+import aiosqlite
 # --- فاز ۱: راه‌اندازی لاگ‌گیری حرفه‌ای با فرمت JSON ---
 
 class JsonFormatter(logging.Formatter):
@@ -121,64 +121,63 @@ def initialize_database():
 
 # --- پایان تابع جدید ---
 
-# --- جدید: تابع ذخیره معامله در دیتابیس ---
-async def save_trade_to_db(trade_data: dict):
+
+
+
+async def save_trade_to_db(trade_data: dict, db_conn: aiosqlite.Connection):
     """
-    اطلاعات معامله بسته شده را در پایگاه داده SQLite ذخیره می‌کند.
-    (نسخه اصلاح شده با ساختار جدید source_name_map)
+    (بازنویسی شده)
+    اطلاعات معامله بسته شده را به صورت ناهمزمان در پایگاه داده SQLite ذخیره می‌کند.
     """
     log_extra = {'entity_id': trade_data.get('source_ticket', 'N/A'), 'status': 'pending_save'}
-    required_keys = ['copy_id', 'symbol', 'profit', 'source_file', 'source_account_number', 'source_ticket'] # source_ticket هم اضافه شد
+    required_keys = ['copy_id', 'symbol', 'profit', 'source_file', 'source_account_number', 'source_ticket']
     if not all(key in trade_data for key in required_keys):
         logger.warning("Missing required data for saving trade to DB.", extra={**log_extra, 'details': trade_data, 'status': 'save_skipped'})
         return
 
-    # استخراج source_id و source_name از source_name_map بر اساس source_file
     source_info = source_name_map.get(trade_data['source_file'])
     source_id = source_info['id'] if source_info else None
-    source_name_for_state = source_info['name'] if source_info else trade_data['source_file'] # نام برای ذخیره در state
+    source_name_for_state = source_info['name'] if source_info else trade_data['source_file']
 
-    # --- اصلاح شده: آپدیت state با نام منبع ---
     global state_data, state_changed
-    if state_data.get(str(trade_data['source_ticket'])) != source_name_for_state: # کلید state باید رشته باشد
+    if state_data.get(str(trade_data['source_ticket'])) != source_name_for_state:
         state_data[str(trade_data['source_ticket'])] = source_name_for_state
         state_changed = True
-    # --- پایان اصلاح ---
-
 
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    db_id = -1
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
+        cursor = await db_conn.execute('''
             INSERT INTO trades (timestamp, copy_id, source_id, source_account_number, symbol, profit, source_file)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         ''', (
             timestamp,
             trade_data['copy_id'],
-            source_id, # حالا ID صحیح ذخیره می‌شود
+            source_id,
             trade_data['source_account_number'],
             trade_data['symbol'],
             trade_data['profit'],
             trade_data['source_file']
         ))
-        conn.commit()
-        conn.close()
-        logger.info(f"Trade saved to DB successfully.", extra={**log_extra,'db_id': cursor.lastrowid, 'status': 'save_success'})
+        await db_conn.commit()
+        db_id = cursor.lastrowid
+        await cursor.close()
+        
+        logger.info(f"Trade saved to DB.", extra={**log_extra,'db_id': db_id, 'status': 'save_success'})
 
-        # --- اصلاح شده: حذف از state پس از ذخیره ---
         if str(trade_data['source_ticket']) in state_data:
             del state_data[str(trade_data['source_ticket'])]
             state_changed = True
-        # --- پایان اصلاح ---
 
-    except sqlite3.Error as e:
-        logger.error("Failed to save trade to DB.", extra={**log_extra, 'error': str(e), 'status': 'save_failure'})
+    except aiosqlite.Error as e:
+        logger.error("Failed to save trade to DB (async).", extra={**log_extra, 'error': str(e), 'status': 'save_failure'})
     except Exception as e:
-         logger.critical("Unexpected error during saving trade to DB.", extra={**log_extra, 'error': str(e), 'status': 'save_failure'})
+         logger.critical("Unexpected error during async save trade to DB.", extra={**log_extra, 'error': str(e), 'status': 'save_failure'})
 
-# --- پایان تابع جدید ---
+
+
+
 
 def load_source_names():
     """
@@ -460,12 +459,12 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
 
 
 
-# --- فاز ۳، بخش اول: نظارت ناهمزمان بر فایل‌ها (نسخه اصلاح شده) ---
 
-async def follow_log_file(context: ContextTypes.DEFAULT_TYPE, filepath: str):
+async def follow_log_file(context: ContextTypes.DEFAULT_TYPE, filepath: str, db_conn: aiosqlite.Connection):
     """
+    (بازنویسی شده)
     یک فایل لاگ را به صورت ناهمزمان دنبال کرده، خطوط جدید را پردازش،
-    پیام تلگرام ارسال کرده و داده‌های معامله را برای ذخیره در DB ارسال می‌کند.
+    پیام تلگرام ارسال کرده و داده‌های معامله را برای ذخیره در DB (با استفاده از اتصال async) ارسال می‌کند.
     """
     task_name = asyncio.current_task().get_name()
     log_extra = {'task_name': task_name, 'entity_id': os.path.basename(filepath)}
@@ -474,34 +473,30 @@ async def follow_log_file(context: ContextTypes.DEFAULT_TYPE, filepath: str):
 
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
-            f.seek(0, 2) # رفتن به انتهای فایل
+            f.seek(0, 2)
             while True:
                 line = f.readline()
                 if not line:
-                    await asyncio.sleep(1) # اگر خط جدیدی نبود، صبر کن
+                    await asyncio.sleep(1)
                     continue
 
-                # --- تغییر: دریافت هر دو مقدار بازگشتی ---
                 formatted_message, trade_data_for_db = parse_and_format_log_line(line)
 
-                # اگر پیامی برای ارسال وجود داشت
                 if formatted_message:
                     await send_telegram_alert(context, formatted_message)
 
-                # --- جدید: اگر داده‌ای برای ذخیره در DB وجود داشت ---
                 if trade_data_for_db:
-                    await save_trade_to_db(trade_data_for_db)
-                # --- پایان بخش جدید ---
+                    # تغییر کلیدی: ارسال اتصال دیتابیس به تابع ذخیره‌سازی
+                    await save_trade_to_db(trade_data_for_db, db_conn)
 
     except FileNotFoundError:
         logger.warning("Log file was not found or has been deleted. Task is stopping.", extra=log_extra)
     except asyncio.CancelledError:
         logger.info("Log file watch task has been cancelled.", extra=log_extra)
-        pass # این خطا طبیعی است
+        pass
     except Exception as e:
         logger.error("An unexpected error occurred while watching log file.", extra={**log_extra, 'error': str(e), 'status': 'failure'})
         await send_telegram_alert(context, f"🚨 *Critical Watcher Error*\n\nTask `{task_name}` failed while watching `{os.path.basename(filepath)}`\nError: `{str(e)}`")
-
 
 
 
@@ -631,64 +626,82 @@ async def save_source_statuses_periodically():
 
 
 
+
 async def main():
     """
-    تابع اصلی برنامه که تمام تسک‌ها را راه‌اندازی و مدیریت می‌کند.
+    (بازنویسی شده)
+    تابع اصلی برنامه که اتصال دیتابیس async را ایجاد کرده
+    و تمام تسک‌ها را راه‌اندازی و مدیریت می‌کند.
     """
     if not all([BOT_TOKEN, ADMIN_ID, LOG_DIRECTORY_PATH]):
         logger.critical("Missing essential environment variables (BOT_TOKEN, ADMIN_ID, LOG_DIRECTORY_PATH). Exiting.")
         return
 
     application = Application.builder().token(BOT_TOKEN).build()
-    logger.info("Log Watcher v3.3 Professional Edition started.")
+    logger.info("Log Watcher v3.4 (Async DB) started.")
+    
     initialize_database()
-
 
     global state_data
     state_data = load_watcher_state()
 
-    asyncio.create_task(batch_state_saver(state_data), name="StateSaver")
-    asyncio.create_task(health_checker(), name="HealthChecker")
-
-    asyncio.create_task(source_health_check(application), name="SourceHealthCheck")
-
-    asyncio.create_task(save_source_statuses_periodically(), name="SourceStatusSaver")
-
-
-    watched_slaves = {}
-
-    while True:
+    db_conn = None
+    try:
+        # --- ایجاد اتصال ناهمزمان دیتابیس ---
         try:
-            load_source_names() 
+            db_conn = await aiosqlite.connect(DB_PATH)
+            logger.info("Async Database connection established.", extra={'entity_id': DB_PATH, 'status': 'success'})
+        except aiosqlite.Error as e:
+            logger.critical("Failed to establish async DB connection. Watcher cannot start.", extra={'error': str(e), 'status': 'db_failure'})
+            return
+        # ---
 
-            log_pattern = os.path.join(LOG_DIRECTORY_PATH, "TradeCopier_*.log")
-            all_files = glob(log_pattern)
+        asyncio.create_task(batch_state_saver(state_data), name="StateSaver")
+        asyncio.create_task(health_checker(), name="HealthChecker")
+        asyncio.create_task(source_health_check(application), name="SourceHealthCheck")
+        asyncio.create_task(save_source_statuses_periodically(), name="SourceStatusSaver")
 
-            slaves_logs = {}
-            for f in all_files:
-                match = re.search(r"TradeCopier_(.*?)_\d{4}\.\d{2}\.\d{2}\.log", os.path.basename(f))
-                if match:
-                    slave_id = match.group(1)
-                    if slave_id:
-                        slaves_logs.setdefault(slave_id, []).append(f)
+        watched_slaves = {}
 
-            for slave_id, files in slaves_logs.items():
-                latest_file = max(files, key=os.path.getctime)
+        while True:
+            try:
+                load_source_names() 
 
-                if slave_id not in watched_slaves or watched_slaves[slave_id]['filepath'] != latest_file:
-                    if slave_id in watched_slaves:
-                        logger.info(f"Switching log file for '{slave_id}'.", extra={'entity_id': slave_id, 'details': f"From {os.path.basename(watched_slaves[slave_id]['filepath'])} to {os.path.basename(latest_file)}"})
-                        watched_slaves[slave_id]['task'].cancel()
+                log_pattern = os.path.join(LOG_DIRECTORY_PATH, "TradeCopier_*.log")
+                all_files = glob(log_pattern)
 
-                    task = asyncio.create_task(follow_log_file(application, latest_file)) # state_data دیگر لازم نیست پاس داده شود
-                    task.set_name(f"watcher_{slave_id}")
-                    watched_slaves[slave_id] = {'filepath': latest_file, 'task': task}
+                slaves_logs = {}
+                for f in all_files:
+                    match = re.search(r"TradeCopier_(.*?)_\d{4}\.\d{2}\.\d{2}\.log", os.path.basename(f))
+                    if match:
+                        slave_id = match.group(1)
+                        if slave_id:
+                            slaves_logs.setdefault(slave_id, []).append(f)
 
-            await asyncio.sleep(60)
+                for slave_id, files in slaves_logs.items():
+                    latest_file = max(files, key=os.path.getctime)
 
-        except Exception as e:
-            logger.critical("A critical error occurred in the main loop.", extra={'error': str(e), 'status': 'main_loop_failure'})
-            await asyncio.sleep(60)
+                    if slave_id not in watched_slaves or watched_slaves[slave_id]['filepath'] != latest_file:
+                        if slave_id in watched_slaves:
+                            logger.info(f"Switching log file for '{slave_id}'.", extra={'entity_id': slave_id, 'details': f"From {os.path.basename(watched_slaves[slave_id]['filepath'])} to {os.path.basename(latest_file)}"})
+                            watched_slaves[slave_id]['task'].cancel()
+
+                        # --- تغییر کلیدی: ارسال db_conn به تسک ---
+                        task = asyncio.create_task(follow_log_file(application, latest_file, db_conn))
+                        task.set_name(f"watcher_{slave_id}")
+                        watched_slaves[slave_id] = {'filepath': latest_file, 'task': task}
+
+                await asyncio.sleep(60)
+
+            except Exception as e:
+                logger.critical("A critical error occurred in the main loop.", extra={'error': str(e), 'status': 'main_loop_failure'})
+                await asyncio.sleep(60)
+                
+    finally:
+        if db_conn:
+            await db_conn.close()
+            logger.info("Async Database connection closed.", extra={'status': 'shutdown'})
+
 
 if __name__ == "__main__":
     try:
