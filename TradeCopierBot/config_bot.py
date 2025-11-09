@@ -330,9 +330,9 @@ async def regenerate_copy_config(copy_id: str, context: ContextTypes.DEFAULT_TYP
                 f"{allowed_symbols},"
                 f"{volume_type},"
                 f"{volume_value},"
-                f"{max_lot_size},"           # ستون ششم
-                f"{max_concurrent_trades}," # ستون هفتم
-                f"{source_drawdown_limit}"  # ستون هشتم
+                f"{max_lot_size},"           
+                f"{max_concurrent_trades},"
+                f"{source_drawdown_limit}"  
             )
             content.append(line)
         else:
