@@ -12,9 +12,10 @@ from telegram.error import TelegramError
 import json
 from logging.handlers import RotatingFileHandler
 import sqlite3
-import datetime # برای timestamp
+import datetime 
 import aiosqlite
 # --- فاز ۱: راه‌اندازی لاگ‌گیری حرفه‌ای با فرمت JSON ---
+
 
 class JsonFormatter(logging.Formatter):
     """
@@ -36,6 +37,7 @@ class JsonFormatter(logging.Formatter):
                 
         # تبدیل دیکشنری به رشته JSON
         return json.dumps(log_record, ensure_ascii=False)
+
 
 # --- پیکربندی اصلی لاگ‌گیری ---
 logger = logging.getLogger(__name__)
@@ -67,10 +69,18 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 # --- Load Environment Variables ---
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")
 LOG_DIRECTORY_PATH = os.getenv("LOG_DIRECTORY_PATH")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 ECOSYSTEM_PATH = os.getenv("ECOSYSTEM_PATH")
+
+ADMIN_IDS = []
+try:
+    ADMIN_IDS = [int(uid) for uid in os.getenv("ADMIN_ID", "").split(",") if uid]
+except (ValueError, TypeError):
+    logger.error("Failed to parse ADMIN_ID list from .env")
+
+if not ADMIN_IDS:
+    logger.warning("No ADMIN_ID configured in .env. Alerts will not be sent to admins.")
 
 
 
@@ -291,62 +301,62 @@ last_message_hash = None
 last_message_time = 0
 DEDUPLICATION_COOLDOWN = 10  # (ثانیه) - از ارسال پیام‌های تکراری در این بازه زمانی جلوگیری می‌کند
 
+
+
 async def send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, message: str):
     """
-    پیام‌ها را به صورت هوشمند به تلگرام ارسال می‌کند.
-    - از ارسال پیام‌های تکراری جلوگیری می‌کند.
-    - در صورت بروز خطای شبکه، مجدداً تلاش می‌کند.
+    (نسخه بازنویسی شده)
+    پیام‌ها را به صورت هوشمند به کانال و تمام ادمین‌ها ارسال می‌کند.
     """
     global last_message_hash, last_message_time
     
-    target_id = CHANNEL_ID if CHANNEL_ID else ADMIN_ID
-    if not target_id:
-        logger.warning("No target ID (CHANNEL_ID or ADMIN_ID) is set. Skipping alert.", extra={'status': 'skipped'})
-        return
-
-    # --- منطق جلوگیری از اسپم ---
+    # --- منطق جلوگیری از اسپم (بدون تغییر) ---
     current_time = time.time()
     message_hash = hash(message)
     if message_hash == last_message_hash and (current_time - last_message_time) < DEDUPLICATION_COOLDOWN:
         logger.info("Skipping duplicate alert.", extra={'details': message[:50] + '...'})
         return
     
-    # --- منطق تلاش مجدد با عقب‌نشینی نمایی (Exponential Backoff) ---
+    last_message_hash = message_hash
+    last_message_time = current_time
+
+    # --- جدید: ساخت لیست مقصد ---
+    target_ids = []
+    if CHANNEL_ID:
+        target_ids.append(CHANNEL_ID)
+    
+    for admin_id in ADMIN_IDS:
+        if admin_id not in target_ids:
+            target_ids.append(admin_id)
+
+    if not target_ids:
+        logger.warning("No target IDs (CHANNEL_ID or ADMIN_IDS) are set. Skipping alert.", extra={'status': 'skipped'})
+        return
+
+    # --- جدید: حلقه ارسال برای همه ---
     max_retries = 3
-    delay = 1.0  # شروع با ۱ ثانیه تاخیر
+    delay = 1.0  
 
-    for attempt in range(max_retries + 1):
-        try:
-            await context.bot.send_message(chat_id=target_id, text=message, parse_mode=ParseMode.MARKDOWN)
-            
-            # در صورت موفقیت، اطلاعات پیام را برای جلوگیری از تکرار ذخیره کن
-            last_message_hash = message_hash
-            last_message_time = current_time
-            
-            logger.info("Alert sent successfully.", extra={'target_id': target_id, 'status': 'success'})
-            return # از حلقه خارج شو
+    for target_id in target_ids:
+        for attempt in range(max_retries + 1):
+            try:
+                await context.bot.send_message(chat_id=target_id, text=message, parse_mode=ParseMode.MARKDOWN)
+                logger.info(f"Alert sent successfully to {target_id}.", extra={'target_id': target_id, 'status': 'success'})
+                break # ارسال موفقیت آمیز بود، برو به سراغ ادمین/کانال بعدی
 
-        except TelegramError as e:
-            log_extra = {'error': str(e), 'attempt': f"{attempt + 1}/{max_retries + 1}", 'status': 'retry_failed'}
-            if attempt < max_retries:
-                logger.warning(f"Failed to send alert, retrying in {delay:.1f}s...", extra=log_extra)
-                await asyncio.sleep(delay)
-                delay *= 2  # زمان تاخیر را دو برابر کن
-            else:
-                logger.error("Failed to send alert after multiple retries.", extra=log_extra)
-                # اگر ارسال به کانال شکست خورد، یک بار به ادمین اطلاع بده
-                if target_id == CHANNEL_ID and ADMIN_ID:
-                    try:
-                        fallback_msg = f"⚠️ *Channel Send Failed*\n\nOriginal message:\n{message}"
-                        await context.bot.send_message(chat_id=ADMIN_ID, text=fallback_msg, parse_mode=ParseMode.MARKDOWN)
-                        logger.info("Fallback alert sent to ADMIN_ID.", extra={'status': 'fallback_success'})
-                    except TelegramError as e2:
-                        logger.critical("Fallback to ADMIN_ID also failed.", extra={'error': str(e2), 'status': 'fallback_failed'})
-                return # شکست نهایی
-        except Exception as e:
-            logger.critical("An unexpected error occurred in send_telegram_alert.", extra={'error': str(e)})
-            return
-            
+            except TelegramError as e:
+                log_extra = {'error': str(e), 'attempt': f"{attempt + 1}/{max_retries + 1}", 'status': 'retry_failed', 'target_id': target_id}
+                if attempt < max_retries:
+                    logger.warning(f"Failed to send alert to {target_id}, retrying in {delay:.1f}s...", extra=log_extra)
+                    await asyncio.sleep(delay)
+                    delay *= 2  # زمان تاخیر را دو برابر کن
+                else:
+                    logger.error(f"Failed to send alert to {target_id} after multiple retries.", extra=log_extra)
+                    # اگر ارسال به یک ادمین شکست خورد، به ادمین‌های دیگر اطلاع نده (جلوگیری از حلقه خطا)
+                    break # از حلقه تلاش مجدد خارج شو، برو سراغ ادمین بعدی
+            except Exception as e:
+                logger.critical(f"An unexpected error occurred in send_telegram_alert for target {target_id}.", extra={'error': str(e), 'target_id': target_id})
+                break # برو سراغ ادمین بعدی            
 
 
 
@@ -731,7 +741,7 @@ async def main():
     تابع اصلی برنامه که اتصال دیتابیس async را ایجاد کرده
     و تمام تسک‌ها را راه‌اندازی و مدیریت می‌کند.
     """
-    if not all([BOT_TOKEN, ADMIN_ID, LOG_DIRECTORY_PATH]):
+    if not all([BOT_TOKEN, ADMIN_IDS, LOG_DIRECTORY_PATH]):
         logger.critical("Missing essential environment variables (BOT_TOKEN, ADMIN_ID, LOG_DIRECTORY_PATH). Exiting.")
         return
 

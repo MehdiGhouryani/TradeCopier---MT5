@@ -53,16 +53,24 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 1717599240))
 ECOSYSTEM_PATH_STR = os.getenv("ECOSYSTEM_PATH")
 LOG_DIRECTORY_PATH = os.getenv("LOG_DIRECTORY_PATH")
+
+# --- جدید: بارگذاری لیست ادمین‌ها برای دریافت خطاها ---
+ADMIN_IDS = []
+try:
+    ADMIN_IDS = [int(uid) for uid in os.getenv("ADMIN_ID", "").split(",") if uid]
+except (ValueError, TypeError):
+    logger.error("Failed to parse ADMIN_ID list from .env")
+
+if not ADMIN_IDS:
+    logger.critical("No ADMIN_ID configured. Bot error notifications cannot be sent.")
 
 try:
     ALLOWED_USERS = [int(uid) for uid in os.getenv("ALLOWED_USERS", "").split(",") if uid]
 except (ValueError, TypeError):
     ALLOWED_USERS = []
     logger.error("Failed to parse ALLOWED_USERS from .env", extra={'status': 'failure'})
-
 ECOSYSTEM_PATH = ""
 if ECOSYSTEM_PATH_STR:
     base_dir = os.path.dirname(os.path.realpath(__file__))
@@ -86,7 +94,7 @@ def escape_markdown_v2(text: str) -> str:
 
 
 async def notify_admin_on_error(context: ContextTypes.DEFAULT_TYPE, function_name: str, error: Exception, **kwargs):
-    """Send formatted error message to admin."""
+    """(اصلاح شده) Send formatted error message to all admins."""
     details = ", ".join([f"{k}='{v}'" for k, v in kwargs.items()])
     message = (
         f"🚨 *خطای ربات*\n\n"
@@ -94,12 +102,8 @@ async def notify_admin_on_error(context: ContextTypes.DEFAULT_TYPE, function_nam
         f"جزئیات: {escape_markdown_v2(details)}\n"
         f"خطا: `{escape_markdown_v2(str(error))}`"
     )
-    try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=message, parse_mode=ParseMode.MARKDOWN_V2)
-        logger.info("Error notification sent", extra={'status': 'success', 'function': function_name})
-    except Exception as e:
-        logger.error("Failed to send error notification", extra={'status': 'failure', 'error': str(e)})
-
+    await send_to_all_admins(context, message)
+    logger.info("Error notification sent to all admins", extra={'status': 'success', 'function': function_name})
 
 
 
@@ -253,6 +257,21 @@ def load_source_statuses() -> dict:
         return {}
 
 
+
+
+async def send_to_all_admins(context: ContextTypes.DEFAULT_TYPE, message: str, parse_mode: str = ParseMode.MARKDOWN_V2):
+    """
+    یک تابع کمکی برای ارسال پیام به تمام ادمین‌های تعریف شده در ADMIN_IDS.
+    """
+    if not ADMIN_IDS:
+        logger.warning("Attempted to send admin notification, but ADMIN_IDS is empty.")
+        return
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=message, parse_mode=parse_mode)
+        except Exception as e:
+            logger.error(f"Failed to send message to admin {admin_id}", extra={'error': str(e), 'status': 'failure', 'entity_id': admin_id})
 
 
 
@@ -441,9 +460,8 @@ def allowed_users_only(func):
 
 
 def is_admin(user_id: int) -> bool:
-    """Check if user is admin."""
-    return user_id == ADMIN_ID
-
+    """(اصلاح شده) بررسی می‌کند که آیا کاربر در لیست ادمین‌ها قرار دارد یا خیر."""
+    return user_id in ADMIN_IDS
 
 
 def admin_only(func):
@@ -896,15 +914,14 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user = update.effective_user
     log_extra = {'user_id': user.id}
     
-    # --- متن اصلاح شده برای MARKDOWN_V2 ---
-    # کاراکترهای رزرو شده مانند '.' و '-' باید 'escape' شوند (با '\').
+
     help_text = (
         "📖 *راهنمای ربات*\n\n"
         "مدیریت آسان کپی معاملات:\n\n"
         "*دستورات:*\n"
-        "▫️ `/start` \- منوی اصلی و وضعیت سیستم\\.\n"
-        "▫️ `/getlog [copy_id]` \- دریافت لاگ حساب (مثال: `/getlog copy_A`)\\.\n"
-        "▫️ `/clean_old_logs` \- حذف لاگ‌های قدیمی\\.\n\n"
+        "▫️ `/start` \\- منوی اصلی و وضعیت سیستم\\.\n"  # <-- اصلاح شد
+        "▫️ `/getlog [copy_id]` \\- دریافت لاگ حساب (مثال: `/getlog copy_A`)\\.\n"  # <-- اصلاح شد
+        "▫️ `/clean_old_logs` \\- حذف لاگ‌های قدیمی\\.\n\n"  # <-- اصلاح شد
         "*منوها:*\n"
         "🔹 *وضعیت:* نمایش وضعیت حساب‌ها و اتصالات\\.\n"
         "🔹 *حساب‌های کپی:* افزودن/حذف و تنظیم ریسک\\.\n"
@@ -919,7 +936,6 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     try:
         if update.callback_query:
-            # اگر از دکمه آمده، پیام را ویرایش کن
             await update.callback_query.edit_message_text(
                 help_text,
                 reply_markup=reply_markup,
@@ -927,7 +943,6 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             log_extra['action'] = 'edit'
         else:
-            # اگر با دستوری مانند /help فراخوانی شود (برای آینده)
             await update.message.reply_text(
                 help_text,
                 reply_markup=reply_markup,
@@ -1911,27 +1926,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     full_message = header + update_info + user_data_info + traceback_info
     MAX_MESSAGE_LENGTH = 4096
     if len(full_message) <= MAX_MESSAGE_LENGTH:
-        try:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=full_message, parse_mode=ParseMode.MARKDOWN_V2)
-        except Exception as e:
-            logger.error("Error notification send failed", extra={'status': 'failure', 'error': str(e)})
+        await send_to_all_admins(context, full_message)
     else:
         try:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=header, parse_mode=ParseMode.MARKDOWN_V2)
+            await send_to_all_admins(context, header)
             with open("error_traceback.txt", "w", encoding="utf-8") as f:
                 f.write(f"Update Info:\n{update_str}\n\nUser Data:\n{user_data_str}\n\nTraceback:\n{tb_string}")
             with open("error_traceback.txt", "rb") as f:
-                await context.bot.send_document(chat_id=ADMIN_ID, document=f, caption="جزئیات خطا پیوست شد.")
+                if ADMIN_IDS:
+                    await context.bot.send_document(chat_id=ADMIN_IDS[0], document=f, caption="جزئیات خطا پیوست شد.")
             os.remove("error_traceback.txt")
         except Exception as e:
             logger.error("Error document send failed", extra={'status': 'failure', 'error': str(e)})
 
 
 
-
-
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """A scheduled job that automatically cleans up old ecosystem backup files."""
+    """(اصلاح شده) یک کار زمان‌بندی شده که فایل‌های پشتیبان قدیمی را پاک کرده و به تمام ادمین‌ها گزارش می‌دهد."""
     log_extra = {'job_name': 'backup_cleanup'}
     logger.info("Automatic backup cleanup job started.", extra=log_extra)
 
@@ -1960,20 +1971,22 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 error_log['error'] = str(e)
                 logger.error(f"Failed to delete backup file during scheduled job: {os.path.basename(file_path)}", extra=error_log)
 
-        # ارسال گزارش به ادمین در صورت انجام عملیات
         if deleted_count > 0 or errors_count > 0:
             message = f"🤖 *گزارش پاک‌سازی خودکار پشتیبان‌ها*\n\n"
             message += f"🗑️ *فایل‌های حذف شده:* {deleted_count}\n"
             if errors_count > 0:
                 message += f"🚨 *خطا در حذف:* {errors_count}"
             
-            await context.bot.send_message(chat_id=ADMIN_ID, text=message, parse_mode=ParseMode.MARKDOWN_V2)
+            await send_to_all_admins(context, message)
             logger.info(f"Automatic backup cleanup finished. Deleted: {deleted_count}, Errors: {errors_count}", extra=log_extra)
-
+            
     except Exception as e:
         log_extra['error'] = str(e)
         logger.critical("A critical error occurred in the automatic backup cleanup job.", extra=log_extra)
-        await context.bot.send_message(chat_id=ADMIN_ID, text=f"🚨 *خطای بحرانی در جاب پاک‌سازی خودکار*:\n`{escape_markdown_v2(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
+        
+        error_message = f"🚨 *خطای بحرانی در جاب پاک‌سازی خودکار*:\n`{escape_markdown_v2(str(e))}`"
+        await send_to_all_admins(context, error_message)
+
 
 
 
@@ -2047,8 +2060,6 @@ async def main() -> None:
         logger.critical(f"Bot polling loop failed critically.", extra={'error': str(e), 'status': 'failure'})
     finally:
         logger.info("Starting graceful shutdown...")
-        if application.updater and application.updater.is_running:
-            await application.updater.stop()
         await application.stop()
         await application.shutdown()
         
