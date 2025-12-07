@@ -367,21 +367,17 @@ close_pattern = re.compile(r'\[TRADE_CLOSE\]\s+([^,]+),([^,]+),([^,]+),([^,]+),(
 alert_pattern = re.compile(r'\[DD_ALERT\]\s+(.*)')
 stop_pattern = re.compile(r'\[DD_STOP\]\s+(.*)')
 
+profit_stop_pattern = re.compile(r'\[PROFIT_STOP\]\s+(.*)')
+
 reset_pattern = re.compile(r'\[DD_RESET\]\s+([^,]+),?(.*)')
 
 error_pattern = re.compile(r'\[ERROR\]\s+-\s+(.*)') 
 
-# مثال LIMIT_MAX_LOT: copy_A,TradeCopier_S1.txt,0.50,0.10
 limit_max_lot_pattern = re.compile(r'\[LIMIT_MAX_LOT\]\s+([^,]+),([^,]+),([^,]+),([^,]+)')
 
-# مثال LIMIT_MAX_TRADES: copy_A,TradeCopier_S1.txt,3,3
 limit_max_trades_pattern = re.compile(r'\[LIMIT_MAX_TRADES\]\s+([^,]+),([^,]+),(\d+),(\d+)')
 
-# مثال LIMIT_SOURCE_DD: copy_A,TradeCopier_S1.txt,-215.50,200.00,3
 limit_source_dd_pattern = re.compile(r'\[LIMIT_SOURCE_DD\]\s+([^,]+),([^,]+),([^,]+),([^,]+),(\d+)')
-
-
-
 
 
 def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
@@ -461,8 +457,6 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
                 'source_ticket': source_ticket_str
             }
 
-
-            
         elif match := alert_pattern.search(line):
              parts = [p.strip() for p in match.group(1).split(',')];
              if len(parts) != 5: raise ValueError(f"Invalid ALERT format: {len(parts)} parts")
@@ -478,6 +472,23 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
              formatted_message = (f"🔴 *Copy Stopped Due to DD Limit*\n\n*Account:* `{copy_id}`\n"
                                 f"*Loss at Stop:* `%{float(dd):.2f}` `(-${float(dollar_loss):,.2f})`\n"
                                 f"*Stop Threshold:* `%{float(dd_limit):,.2f}`")
+
+        # --- بخش جدید: پردازش پیام تارگت سود ---
+        elif match := profit_stop_pattern.search(line):
+             parts = [p.strip() for p in match.group(1).split(',')]
+             if len(parts) != 5: raise ValueError(f"Invalid PROFIT_STOP format: {len(parts)} parts")
+             # فرمت لاگ: CopyID, CurrentProfit%, Target%, DollarProfit, StartEquity
+             copy_id, current_percent, target_percent, dollar_profit, start_equity = parts
+             
+             formatted_message = (
+                 f"🟢 *Daily Profit Target Hit!* 🚀\n\n"
+                 f"*Account:* `{copy_id}`\n"
+                 f"*Profit Secured:* `+${float(dollar_profit):,.2f}` (`+{float(current_percent):.2f}%`)\n"
+                 f"*Target Was:* `{float(target_percent):.2f}%`\n"
+                 f"*Start Equity:* `${float(start_equity):,.2f}`\n\n"
+                 f"✅ Copying has been paused for the rest of the day to protect profits."
+             )
+        # ---------------------------------------
         
         elif match := reset_pattern.search(line):
              copy_id = match.group(1).strip()
@@ -567,7 +578,6 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
 
 
 
-
 async def follow_log_file(context: ContextTypes.DEFAULT_TYPE, filepath: str, db_conn: aiosqlite.Connection):
     """
     (بازنویسی شده)
@@ -635,8 +645,10 @@ async def health_checker():
 
 async def source_health_check(context: ContextTypes.DEFAULT_TYPE):
     """
+    (اصلاح شده)
     به صورت دوره‌ای زمان آخرین تغییر فایل‌های سورس را بررسی کرده و
     در صورت عدم به‌روزرسانی، هشدار قطع ارتباط ارسال می‌کند.
+    (هشدار تکراری قطع ارتباط در این نسخه غیرفعال شده است).
     """
     global source_statuses
     DISCONNECT_THRESHOLD = 120 # ثانیه (۲ دقیقه)
@@ -676,24 +688,22 @@ async def source_health_check(context: ContextTypes.DEFAULT_TYPE):
                         source_statuses[file_path] = {"status": "disconnected", "last_alert_time": now}
                         logger.warning(f"Source '{source_name}' seems disconnected (no update for {time_since_update:.0f}s).", extra=log_extra)
                     elif now - current_status_info.get("last_alert_time", 0) > ALERT_COOLDOWN:
-                         # اگر قبلا قطع بوده و زمان زیادی گذشته، دوباره هشدار بده
-                         logger.info(f"Source '{source_name}' remains disconnected (no update for {time_since_update:.0f}s). Re-alerting.", extra=log_extra)
-                         message = f"🕒 *Source Still Disconnected*\n\nSource `{source_name}` (File: `{file_path}`) remains inactive."
-                         await send_telegram_alert(context, message)
+                         # --- (اصلاح شده) غیرفعال کردن هشدار تکراری قطع ارتباط ---
+                         logger.info(f"Source '{source_name}' remains disconnected (no update for {time_since_update:.0f}s). Re-alerting is disabled, skipping Telegram message.", extra=log_extra)
+                         # message = f"🕒 *Source Still Disconnected*\n\nSource `{source_name}` (File: `{file_path}`) remains inactive."
+                         # await send_telegram_alert(context, message)
                          source_statuses[file_path]["last_alert_time"] = now # زمان آخرین هشدار آپدیت شود
 
-                # --- منطق اتصال مجدد ---
                 else:
                     if current_status == "disconnected":
                         message = f"✅ *Source Reconnected*\n\nSource `{source_name}` (File: `{file_path}`) is now updating again."
                         await send_telegram_alert(context, message)
                         source_statuses[file_path] = {"status": "connected", "last_alert_time": 0} # ریست کردن وضعیت
                         logger.info(f"Source '{source_name}' reconnected.", extra=log_extra)
-                    # else: وضعیت 'connected' بوده و هنوز هم هست، کاری نکن
+
 
             except FileNotFoundError:
                 if file_path not in source_statuses or source_statuses[file_path]["status"] != "file_not_found":
-                     # اگر فایل برای اولین بار پیدا نشد یا وضعیت قبلی چیز دیگری بود
                      message = f"❌ *Source File Not Found*\n\nFile `{file_path}` for source `{source_name}` was not found. Ensure the source EA is configured correctly."
                      await send_telegram_alert(context, message)
                      source_statuses[file_path] = {"status": "file_not_found", "last_alert_time": now}
@@ -701,12 +711,10 @@ async def source_health_check(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Error checking source file status for {file_path}: {e}", extra={**log_extra, 'error': str(e)})
 
-        # --- پاک کردن سورس‌های حذف شده از ecosystem.json ---
         removed_files = set(source_statuses.keys()) - checked_files
         for removed_file in removed_files:
             del source_statuses[removed_file]
             logger.info(f"Removed '{removed_file}' from health check status (no longer in ecosystem).", extra=log_extra_base)
-# --- پایان تابع جدید ---
 
 
 

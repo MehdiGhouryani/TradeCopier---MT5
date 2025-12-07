@@ -14,6 +14,8 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 import aiosqlite
 import asyncio
+from datetime import time
+
 
 
 class JsonFormatter(logging.Formatter):
@@ -380,7 +382,6 @@ async def regenerate_copy_config(copy_id: str, context: ContextTypes.DEFAULT_TYP
 
 
 
-
 async def regenerate_copy_settings_config(copy_id: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Regenerate settings configuration file for a copy account."""
     ecosystem = context.bot_data.get('ecosystem', {})
@@ -388,15 +389,20 @@ async def regenerate_copy_settings_config(copy_id: str, context: ContextTypes.DE
     if not copy_account:
         logger.error("Copy account not found for config regeneration", extra={'entity_id': copy_id, 'status': 'failure'})
         return False
+        
     settings = copy_account.get('settings', {})
     config_path = os.path.join(os.path.dirname(ECOSYSTEM_PATH), f"{copy_id}_config.txt")
     tmp_path = config_path + ".tmp"
+    
     content = []
     if context.user_data.get('reset_stop_for_copy') == copy_id:
         content.append("ResetStop=true")
         context.user_data.pop('reset_stop_for_copy', None)
+        
+    # این حلقه به صورت خودکار DailyProfitTargetPercent را هم شامل می‌شود
     for key, value in settings.items():
         content.append(f"{key}={value}")
+        
     try:
         with open(tmp_path, 'w', encoding='utf-8') as f:
             f.write("\n".join(content))
@@ -409,6 +415,7 @@ async def regenerate_copy_settings_config(copy_id: str, context: ContextTypes.DE
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         return False
+
 
 
 
@@ -1221,12 +1228,8 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
 
 
 
-
 async def _display_copy_account_menu(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, copy_id: str):
-    """
-    Helper function to display the settings menu for a specific copy account.
-    This version includes visual feedback for the pending 'ResetStop' action.
-    """
+    """Display settings menu for a specific copy account."""
     ecosystem = context.bot_data.get('ecosystem', {})
     copy_account = next((c for c in ecosystem.get('copies', []) if c['id'] == copy_id), None)
     
@@ -1236,25 +1239,43 @@ async def _display_copy_account_menu(query: CallbackQuery, context: ContextTypes
 
     settings = copy_account.get('settings', {})
     
-    # --- آماده‌سازی متن دکمه‌ها ---
+    # --- وضعیت‌های موجود ---
+    master_switch = settings.get("MasterSwitch", True)
+    switch_emoji = "🟢" if master_switch else "🔴"
+    switch_status = "روشن" if master_switch else "خاموش"
+    switch_text = f"وضعیت کپی: {switch_emoji} {switch_status}"
+
+    auto_enable = settings.get("AutoMasterSwitch", False)
+    auto_emoji = "✅" if auto_enable else "❌"
+    auto_text = f"روشن خودکار (شروع روز): {auto_emoji}"
+
     dd = float(settings.get("DailyDrawdownPercent", 0))
     dd_status_text = f"ریسک روزانه: {'🟢 فعال' if dd > 0 else '🔴 غیرفعال'}"
+
+    # --- بخش جدید: تارگت سود ---
+    profit_target = float(settings.get("DailyProfitTargetPercent", 0))
+    profit_status_text = f"تارگت سود: {'🟢 فعال' if profit_target > 0 else '🔴 غیرفعال'}"
 
     copy_mode = settings.get("CopySymbolMode", "GOLD_ONLY")
     cm_text = "فقط طلا" if copy_mode == "GOLD_ONLY" else "همه نمادها"
     copy_mode_status_text = f"حالت کپی: {cm_text}"
 
-    # ✅ هوشمندسازی دکمه ریست قفل
-    # بررسی می‌کند آیا دستوری برای ریست این حساب خاص در انتظار است یا خیر
     is_reset_pending = context.user_data.get('reset_stop_for_copy') == copy_id
     reset_stop_text = "ریست قفل (در انتظار بازسازی ⏳)" if is_reset_pending else "ریست قفل (ResetStop)"
 
     keyboard = [
+        [InlineKeyboardButton(switch_text, callback_data=f"setting:action:toggle_switch:{copy_id}")],
+        [InlineKeyboardButton(auto_text, callback_data=f"setting:action:toggle_auto_enable:{copy_id}")],
+        
         [InlineKeyboardButton(dd_status_text, callback_data=f"setting:action:toggle_dd:{copy_id}")],
+        [InlineKeyboardButton(profit_status_text, callback_data=f"setting:action:toggle_profit:{copy_id}")], # <--- دکمه جدید
+        
         [InlineKeyboardButton(copy_mode_status_text, callback_data=f"setting:action:copy_mode:{copy_id}")],
+        
         [InlineKeyboardButton("تنظیم حد ضرر روزانه (%)", callback_data="setting_input_copy_DailyDrawdownPercent")],
         [InlineKeyboardButton("تنظیم حد هشدار (%)", callback_data="setting_input_copy_AlertDrawdownPercent")],
-        # ✅ استفاده از متن هوشمند جدید
+        [InlineKeyboardButton("تنظیم تارگت سود روزانه (%)", callback_data="setting_input_copy_DailyProfitTargetPercent")], # <--- دکمه جدید
+        
         [InlineKeyboardButton(reset_stop_text, callback_data=f"setting:action:reset_stop:{copy_id}")],
         [InlineKeyboardButton("🗑️ حذف حساب", callback_data=f"setting:delete:confirm:{copy_id}")],
         [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="menu_copy_settings")]
@@ -1268,11 +1289,13 @@ async def _display_copy_account_menu(query: CallbackQuery, context: ContextTypes
         )
     except BadRequest as e:
         if "Message is not modified" in str(e):
-            logger.debug("Menu refresh skipped as content was unchanged.", extra={'entity_id': copy_id})
-            pass
+            logger.debug("Menu refresh skipped.", extra={'entity_id': copy_id})
         else:
-            logger.error("A BadRequest occurred while editing message", extra={'error': str(e)})
+            logger.error("BadRequest editing message", extra={'error': str(e)})
             raise
+
+
+
 
 @allowed_users_only
 async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1318,7 +1341,25 @@ async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAU
         settings = copy_account.get('settings', {})
         feedback_text = ""
 
-        if sub_action == "toggle_dd":
+        # --- هندل کردن دکمه خاموش/روشن (دستی) ---
+        if sub_action == "toggle_switch":
+            current_status = settings.get("MasterSwitch", True)
+            new_status = not current_status
+            settings["MasterSwitch"] = new_status
+            status_str = "روشن" if new_status else "خاموش"
+            feedback_text = f"✅ حساب کپی {status_str} شد."
+            logger.info("Master switch toggled", extra={'user_id': user_id, 'entity_id': copy_id, 'details': {'to': new_status}})
+
+        # --- هندل کردن دکمه روشن خودکار (جدید) ---
+        elif sub_action == "toggle_auto_enable":
+            current_auto = settings.get("AutoMasterSwitch", False)
+            new_auto = not current_auto
+            settings["AutoMasterSwitch"] = new_auto
+            status_str = "فعال" if new_auto else "غیرفعال"
+            feedback_text = f"✅ قابلیت روشن خودکار {status_str} شد."
+            logger.info("Auto-Enable feature toggled", extra={'user_id': user_id, 'entity_id': copy_id, 'details': {'to': new_auto}})
+
+        elif sub_action == "toggle_dd":
             old_dd = float(settings.get("DailyDrawdownPercent", 0))
             new_dd = 0 if old_dd > 0 else 5.0
             settings["DailyDrawdownPercent"] = new_dd
@@ -1339,6 +1380,8 @@ async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAU
 
         if feedback_text:
             if save_ecosystem(context):
+                # بازسازی کانفیگ برای اعمال تغییرات MasterSwitch (اگر تغییر کرده باشد)
+                # تغییر AutoMasterSwitch فعلاً فقط در ecosystem ذخیره می‌شود و در جاب روزانه استفاده می‌شود
                 await regenerate_copy_settings_config(copy_id, context)
                 await query.answer(feedback_text)
                 await _display_copy_account_menu(query, context, copy_id)
@@ -1348,13 +1391,13 @@ async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAU
                 await query.answer("❌ خطا در ذخیره‌سازی تغییرات.")
         return
 
-    # --- منطق افزودن حساب جدید (بازنویسی شده) ---
+    # --- منطق افزودن حساب جدید ---
     if action == "setting" and parts[1] == "add":
         if parts[2] == "start":
             context.user_data.clear()
             
             existing_ids = {c['id'] for c in ecosystem.get('copies', [])}
-            possible_ids = [f"copy_{chr(ord('A') + i)}" for i in range(10)] # Creates copy_A to copy_J
+            possible_ids = [f"copy_{chr(ord('A') + i)}" for i in range(10)]
             
             new_copy_id = None
             for pid in possible_ids:
@@ -1410,6 +1453,8 @@ async def _handle_copy_settings_menu(update: Update, context: ContextTypes.DEFAU
                 logger.error("Copy deletion save failed", extra=log_extra)
                 await query.edit_message_text("❌ خطا در هنگام حذف حساب\\. لطفا لاگ‌ها را بررسی کنید.", parse_mode=ParseMode.MARKDOWN_V2)
             return
+
+
 
 
 @allowed_users_only
@@ -1989,6 +2034,44 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
+async def auto_enable_job(context: ContextTypes.DEFAULT_TYPE):
+    """Daily job to auto-enable copy accounts if configured."""
+    ecosystem = context.bot_data.get('ecosystem', {})
+    copies = ecosystem.get('copies', [])
+    updated_count = 0
+    enabled_accounts = []
+    
+    for copy_account in copies:
+        settings = copy_account.get('settings', {})
+        
+        # شرط: قابلیت اتوماتیک فعال باشد + حساب الان خاموش باشد
+        if settings.get("AutoMasterSwitch", False) is True and settings.get("MasterSwitch", True) is False:
+            settings["MasterSwitch"] = True
+            updated_count += 1
+            enabled_accounts.append(copy_account.get('name', copy_account['id']))
+            logger.info(f"Auto-Enabling account: {copy_account['id']}", extra={'task': 'auto_enable_job'})
+
+    if updated_count > 0:
+        # ذخیره تغییرات در فایل JSON
+        if save_ecosystem(context):
+            # بازسازی فایل‌های کانفیگ برای اعمال در اکسپرت
+            await regenerate_all_configs(context)
+            
+            # گزارش به ادمین‌ها
+            acc_list = "\n".join([f"▫️ {name}" for name in enabled_accounts])
+            msg = (
+                f"🌅 *گزارش شروع روز جدید*\n\n"
+                f"✅ تعداد {updated_count} حساب بصورت خودکار *روشن* شدند:\n"
+                f"{acc_list}"
+            )
+            await send_to_all_admins(context, msg)
+        else:
+            logger.error("Failed to save ecosystem in auto-enable job", extra={'task': 'auto_enable_job'})
+    else:
+        logger.info("Auto-enable job ran. No accounts needed enabling.", extra={'task': 'auto_enable_job'})
+
+
+
 
 async def main() -> None:
     if not all([BOT_TOKEN, ECOSYSTEM_PATH, ALLOWED_USERS, LOG_DIRECTORY_PATH]):
@@ -2022,8 +2105,14 @@ async def main() -> None:
         return
 
     job_queue = application.job_queue
+    
+    # 1. جاب پاک‌سازی بکاپ‌ها (هفتگی)
     seven_days_in_seconds = 604800
     job_queue.run_repeating(cleanup_job, interval=seven_days_in_seconds, name="weekly_backup_cleanup")
+    
+    # 2. جاب روشن کردن خودکار حساب‌ها (روزانه ساعت 00:01)
+    # این جاب وضعیت MasterSwitch را در شروع روز ریست می‌کند
+    job_queue.run_daily(auto_enable_job, time=time(hour=0, minute=1), name="daily_auto_enable")
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("getlog", get_log_handler))
@@ -2069,10 +2158,11 @@ async def main() -> None:
         
         logger.info("Bot shutdown complete.")
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot execution stopped by user (Ctrl+C).")
-    except Exception as e:
-        logger.critical(f"Fatal error in main execution", extra={'error': str(e), 'status': 'fatal'})
+
+
+
+
+
+
+
+
