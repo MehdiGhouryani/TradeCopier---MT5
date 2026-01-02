@@ -92,7 +92,69 @@ def escape_markdown_v2(text: str) -> str:
     return ''.join(f'\\{char}' if char in escape_chars else char for char in str(text))
 
 
+# ==========================================
+# +++ بخش مدیریت قفل سورس‌ها (Helper Functions) +++
+# ==========================================
 
+LOCKED_SOURCES_FILE = "locked_sources.json"
+
+def get_locked_sources():
+    """
+    لیست سورس‌های قفل شده را از فایل JSON می‌خواند.
+    """
+    if not os.path.exists(LOCKED_SOURCES_FILE):
+        return []
+    try:
+        with open(LOCKED_SOURCES_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return []
+
+def create_unlock_flag(source_filename):
+    """
+    یک فایل پرچم (Flag) می‌سازد تا اکسپرت متوجه شود باید قفل را باز کند.
+    نام فایل: reset_[source_filename].flag
+    """
+    if not ECOSYSTEM_PATH:
+        return False
+        
+    try:
+        # مسیر پوشه فایل‌های اکوسیستم (که اکسپرت هم به آن دسترسی دارد)
+        base_dir = os.path.dirname(ECOSYSTEM_PATH)
+        flag_name = f"reset_{source_filename}.flag"
+        flag_path = os.path.join(base_dir, flag_name)
+        
+        # ساخت فایل خالی
+        with open(flag_path, 'w') as f:
+            pass
+        return True
+    except Exception as e:
+        logger.error(f"Failed to create unlock flag for {source_filename}: {e}")
+        return False
+
+def unlock_source_file(filename):
+    """
+    نام سورس را از لیست قفل شده‌ها حذف می‌کند و فایل پرچم را می‌سازد.
+    """
+    # 1. حذف از فایل JSON (برای آپدیت ربات)
+    if os.path.exists(LOCKED_SOURCES_FILE):
+        try:
+            with open(LOCKED_SOURCES_FILE, 'r') as f:
+                locked = json.load(f)
+            
+            if filename in locked:
+                locked.remove(filename)
+                with open(LOCKED_SOURCES_FILE, 'w') as f:
+                    json.dump(locked, f)
+        except Exception as e:
+            logger.error(f"Error updating locked_sources.json: {e}")
+            return False
+
+    # 2. ساخت فایل پرچم (برای اطلاع به اکسپرت)
+    # حتی اگر در JSON نبود، باز هم تلاش می‌کنیم فایل پرچم را بسازیم تا مطمئن شویم اکسپرت باز می‌شود
+    return create_unlock_flag(filename)
+
+# ==========================================
 
 
 async def notify_admin_on_error(context: ContextTypes.DEFAULT_TYPE, function_name: str, error: Exception, **kwargs):
@@ -1071,8 +1133,13 @@ async def _display_connections_for_copy(query: CallbackQuery, context: ContextTy
         if "Message is not modified" not in str(e):
             logger.error(f"Error editing connection menu: {e}") 
 
+
+
+
+
 @allowed_users_only
 async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle connection management menu actions."""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -1084,9 +1151,7 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
     try:
         action_part = parts[1] if len(parts) > 1 else None
 
-        # --- نمایش منوی اصلی اتصالات ---
         if data == "menu_connections":
-            # ... (مثل قبل) ...
             context.user_data.clear()
             logger.debug("Navigating to main connections menu", extra=log_extra)
             keyboard = []
@@ -1098,22 +1163,18 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
             await query.edit_message_text("مدیریت اتصالات: یک حساب کپی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
             return
 
-
-        # --- نمایش منوی یک حساب کپی خاص ---
         if action_part == "select_copy":
             copy_id = parts[2]
-            context.user_data['selected_copy_id'] = copy_id # ذخیره برای استفاده‌های بعدی
+            context.user_data['selected_copy_id'] = copy_id
             await _display_connections_for_copy(query, context, copy_id)
             return
 
-        # --- مدیریت اتصال و قطع اتصال (با افزودن مقادیر پیش‌فرض محدودیت‌ها) ---
         if action_part in ["connect", "disconnect"]:
             copy_id, source_id = parts[2], parts[3]
             log_extra.update({'copy_id': copy_id, 'source_id': source_id})
 
             if action_part == "connect":
                 logger.info("Connection process initiated", extra=log_extra)
-                # اضافه کردن مقادیر پیش‌فرض برای محدودیت‌ها (0 = غیرفعال)
                 ecosystem.setdefault('mapping', {}).setdefault(copy_id, []).append({
                     'source_id': source_id,
                     'mode': 'ALL',
@@ -1124,7 +1185,7 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
                     'source_drawdown_limit': 0.0
                 })
                 feedback_text = "✅ اتصال با موفقیت برقرار شد"
-            else: # disconnect
+            else:
                 logger.info("Disconnection process initiated", extra=log_extra)
                 ecosystem['mapping'][copy_id] = [c for c in ecosystem['mapping'].get(copy_id, []) if c['source_id'] != source_id]
                 feedback_text = "✅ اتصال با موفقیت قطع شد"
@@ -1141,10 +1202,8 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
                 await query.answer("❌ خطا در ذخیره‌سازی تغییرات!")
             return
 
-        # --- منوی انتخاب حالت کپی (بدون تغییر) ---
         if action_part == "set_mode_menu":
             copy_id, source_id = parts[2], parts[3]
-            # ... (مثل قبل) ...
             log_extra.update({'copy_id': copy_id, 'source_id': source_id})
             logger.debug("Displaying copy mode selection menu", extra=log_extra)
 
@@ -1161,10 +1220,8 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
             )
             return
 
-        # --- پردازش انتخاب حالت کپی (بدون تغییر) ---
         if action_part == "set_mode_action":
             mode, copy_id, source_id = parts[2], parts[3], parts[4]
-            # ... (مثل قبل) ...
             log_extra.update({'copy_id': copy_id, 'source_id': source_id, 'details': {'new_mode': mode}})
             connection = next((conn for conn in ecosystem.get('mapping', {}).get(copy_id, []) if conn['source_id'] == source_id), None)
             if not connection: await query.answer("❌ خطا: اتصال یافت نشد!", show_alert=True); return
@@ -1173,7 +1230,8 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
                 context.user_data['waiting_for'] = f"conn_symbols:{copy_id}:{source_id}"
                 log_extra['state_set'] = context.user_data['waiting_for']
                 logger.debug("Prompting user for allowed symbols list", extra=log_extra)
-                await query.edit_message_text("لطفاً لیست نمادهای مجاز را وارد کنید\\. نمادها را با سمی‌کالن (;) از هم جدا کنید\\.\nمثال: `EURUSD;GBPUSD;XAUUSD`", parse_mode=ParseMode.MARKDOWN_V2)
+                # ✅ اصلاح شده: پرانتزها اسکیپ شدند \( \)
+                await query.edit_message_text("لطفاً لیست نمادهای مجاز را وارد کنید\\. نمادها را با سمی‌کالن \\(;\\) از هم جدا کنید\\.\nمثال: `EURUSD;GBPUSD;XAUUSD`", parse_mode=ParseMode.MARKDOWN_V2)
                 return
 
             connection['mode'] = mode
@@ -1186,10 +1244,8 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
                 await query.answer("❌ خطا در ذخیره‌سازی تغییرات!")
             return
 
-
-        # --- جدید: مدیریت کلیک روی دکمه‌های تنظیم محدودیت ---
         if action_part == "set_limit":
-            limit_type = parts[2] # 'max_lot', 'max_trades', 'dd_limit'
+            limit_type = parts[2]
             copy_id = parts[3]
             source_id = parts[4]
             context.user_data['waiting_for'] = f"conn_limit:{limit_type}:{copy_id}:{source_id}"
@@ -1223,7 +1279,6 @@ async def _handle_connections_menu(update: Update, context: ContextTypes.DEFAULT
                   await query.edit_message_text("❌ یک خطای غیرمنتظره رخ داد\\. به منوی اصلی بازگردید\\.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")]]), parse_mode=ParseMode.MARKDOWN_V2)
         except:
              await query.message.reply_text("❌ یک خطای غیرمنتظره رخ داد\\. گزارش برای ادمین ارسال شد\\.", parse_mode=ParseMode.MARKDOWN_V2)
-
 
 
 
@@ -1470,18 +1525,40 @@ async def _handle_sources_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     log_extra = {'user_id': user_id, 'callback_data': data}
 
     try:
+        # --- 1. نمایش لیست اصلی سورس‌ها ---
         if action == "sources" and parts[1] == "main":
             context.user_data.clear()
             logger.debug("Navigating to main sources menu", extra=log_extra)
             sources = ecosystem.get('sources', [])
-            keyboard = [
-                [InlineKeyboardButton(escape_markdown_v2(s['name']), callback_data=f"sources:select:{s['id']}")] for s in sources
-            ]
+            
+            # خواندن لیست قفل‌ها برای نمایش وضعیت
+            locked_list = get_locked_sources()
+            
+            keyboard = []
+            for s in sources:
+                fname = s.get('filename', '') 
+                display_name = escape_markdown_v2(s.get('name', 'Unknown'))
+                
+                # اگر قفل بود، علامت ⛔ نشان بده (متن دکمه‌ها نیاز به اسکیپ ندارد)
+                if fname in locked_list:
+                    btn_text = f"⛔ {display_name} (LOCKED)"
+                else:
+                    btn_text = f"📁 {display_name}"
+                
+                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"sources:select:{s['id']}")])
+            
             keyboard.append([InlineKeyboardButton("➕ منبع جدید", callback_data="sources:add:start")])
             keyboard.append([InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")])
-            await query.edit_message_text("مدیریت منابع: یک منبع را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
+            
+            # ✅ اصلاح شده: پرانتزها و علامت مساوی اسکیپ شدند
+            await query.edit_message_text(
+                "مدیریت منابع: یک منبع را انتخاب کنید \(⛔ \= قفل شده\):", 
+                reply_markup=InlineKeyboardMarkup(keyboard), 
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
             return
 
+        # --- 2. نمایش منوی عملیات یک سورس (انتخاب شده) ---
         if action == "sources" and parts[1] == "select":
             source_id = parts[2]
             context.user_data['selected_source_id'] = source_id
@@ -1489,14 +1566,50 @@ async def _handle_sources_menu(update: Update, context: ContextTypes.DEFAULT_TYP
             if not source:
                 await query.edit_message_text("❌ منبع یافت نشد\\.", parse_mode=ParseMode.MARKDOWN_V2)
                 return
-            keyboard = [
-                [InlineKeyboardButton("✏️ ویرایش نام", callback_data=f"sources:action:edit_name:{source_id}")],
-                [InlineKeyboardButton("🗑️ حذف منبع", callback_data=f"sources:delete:confirm:{source_id}")],
-                [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="sources:main")]
-            ]
+            
+            # ++ بررسی وضعیت قفل برای نمایش دکمه آنلاک ++
+            filename = source.get('filename', '')
+            locked_list = get_locked_sources()
+            
+            keyboard = []
+            
+            # اگر سورس قفل است، دکمه آنلاک را در اولویت اول بگذار
+            if filename in locked_list:
+                keyboard.append([InlineKeyboardButton("🔓 باز کردن قفل (Unlock)", callback_data=f"sources:action:unlock:{source_id}")])
+            
+            keyboard.append([InlineKeyboardButton("✏️ ویرایش نام", callback_data=f"sources:action:edit_name:{source_id}")])
+            keyboard.append([InlineKeyboardButton("🗑️ حذف منبع", callback_data=f"sources:delete:confirm:{source_id}")])
+            keyboard.append([InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="sources:main")])
+            
             await query.edit_message_text(f"مدیریت منبع *{escape_markdown_v2(source['name'])}*:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
             return
 
+        # --- 3. هندل کردن دکمه آنلاک (بخش جدید) ---
+        if action == "sources" and parts[1] == "action" and parts[2] == "unlock":
+            source_id = parts[3]
+            source = next((s for s in ecosystem.get('sources', []) if s['id'] == source_id), None)
+            
+            if source:
+                filename = source.get('filename')
+                # فراخوانی تابع کمکی برای حذف از JSON و ساخت فایل Flag
+                if unlock_source_file(filename):
+                    logger.info(f"Source {filename} unlocked manually via bot.", extra=log_extra)
+                    
+                    # پیام موفقیت و بازگشت به لیست
+                    keyboard = [[InlineKeyboardButton("🔙 بازگشت به لیست منابع", callback_data="sources:main")]]
+                    
+                    # ✅ اصلاح شده: پرانتزهای داخل متن ایتالیک اسکیپ شدند
+                    success_msg = (
+                        f"✅ قفل منبع *{escape_markdown_v2(source['name'])}* باز شد\\.\n\n"
+                        f"📡 دستور فعال‌سازی به متاتریدر ارسال شد\\.\n"
+                        f"_\\(چند ثانیه صبر کنید تا اکسپرت فایل پرچم را بخواند\\)_"
+                    )
+                    await query.edit_message_text(success_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
+                else:
+                    await query.answer("❌ خطا در باز کردن قفل (فایل پیدا نشد یا خطای سیستمی).", show_alert=True)
+            return
+
+        # --- 4. سایر بخش‌ها (ویرایش نام، افزودن، حذف) - بدون تغییر ---
         if action == "sources" and parts[1] == "action" and parts[2] == "edit_name":
             source_id = parts[3]
             context.user_data['waiting_for'] = 'source_edit_name'
@@ -1507,15 +1620,12 @@ async def _handle_sources_menu(update: Update, context: ContextTypes.DEFAULT_TYP
             
         if action == "sources" and parts[1] == "add" and parts[2] == "start":
             context.user_data.clear()
-            # ✅ مرحله ۱: وضعیت جدید برای افزودن هوشمند
             context.user_data['waiting_for'] = 'source_add_smart_name'
             logger.debug("Prompting user for new source display name (smart add)", extra=log_extra)
-            # ✅ مرحله ۲: پرسیدن فقط نام نمایشی
             await query.edit_message_text("لطفا نام نمایشی برای منبع جدید را وارد کنید:", parse_mode=ParseMode.MARKDOWN_V2)
             return
 
         if action == "sources" and parts[1] == "delete":
-            # (این بخش بدون تغییر باقی می‌ماند چون از قبل اصلاح شده است)
             sub_action = parts[2]
             source_id = parts[3]
             log_extra['entity_id'] = source_id
@@ -1550,15 +1660,11 @@ async def _handle_sources_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     
     except BadRequest as e:
         if "Message is not modified" in str(e):
-            logger.debug("Skipping message edit: content is identical.", extra=log_extra)
             pass
         else:
             log_extra['error'] = str(e)
             logger.error("A BadRequest occurred in sources menu handler", extra=log_extra)
             raise
-
-
-
 
 
 
@@ -1838,6 +1944,9 @@ STATE_HANDLERS = {
     "conn_symbols": _process_conn_symbols, # 'conn_symbols:' دیگر prefix نیست
 }
 
+
+
+
 @allowed_users_only
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # (بازنویسی شده) - این تابع اصلی، ورودی متنی را مدیریت می‌کند
@@ -1854,14 +1963,23 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     should_clear_state = False
 
     try:
+        # 1. بررسی تطابق دقیق (برای حالت‌هایی مثل source_add_smart_name)
         if waiting_for in STATE_HANDLERS:
             handler = STATE_HANDLERS[waiting_for]
+        
+        # 2. بررسی پیشوندها (برای حالت‌های پویا که شامل ID هستند)
+        elif waiting_for.startswith("conn_symbols:"): # <--- این بخش اضافه شد
+            handler = STATE_HANDLERS["conn_symbols"]
+            
         elif waiting_for.startswith("copy_"):
             handler = _process_copy_setting_value
+            
         elif waiting_for.startswith("conn_volume:"):
             handler = _process_conn_volume_value
+            
         elif waiting_for.startswith("conn_limit:"):
             handler = _process_conn_limit_value
+            
         else:
             logger.warning("No handler found for an active 'waiting_for' state.", extra=log_extra)
             should_clear_state = True # استیت نامعتبر را پاک کن
@@ -1881,8 +1999,6 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if should_clear_state:
             context.user_data.clear()
             logger.debug("State cleared after text input processing.", extra={'user_id': user_id, 'state_cleared_for': waiting_for})
-
-
 
 
 
@@ -2159,7 +2275,13 @@ async def main() -> None:
         logger.info("Bot shutdown complete.")
 
 
-
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot execution stopped by user (Ctrl+C).")
+    except Exception as e:
+        logger.critical(f"Fatal error in main execution", extra={'error': str(e), 'status': 'fatal'})
 
 
 

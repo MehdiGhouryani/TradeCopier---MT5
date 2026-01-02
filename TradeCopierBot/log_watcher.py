@@ -122,6 +122,51 @@ g_benign_error_last_sent = {}
 
 
 
+# --- اضافه کردن زیرساخت مدیریت قفل سورس‌ها ---
+
+# نام فایلی که وضعیت قفل‌ها در آن ذخیره می‌شود
+LOCKED_SOURCES_FILE = "locked_sources.json"
+
+def load_locked_sources():
+    """
+    لیست سورس‌های قفل شده را از فایل JSON می‌خواند.
+    """
+    if not os.path.exists(LOCKED_SOURCES_FILE):
+        return []
+    try:
+        with open(LOCKED_SOURCES_FILE, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return []
+
+def add_locked_source(source_name):
+    """
+    یک سورس جدید را به لیست قفل‌شدگان اضافه می‌کند (بدون تکرار).
+    """
+    locks = load_locked_sources()
+    if source_name not in locks:
+        locks.append(source_name)
+        try:
+            with open(LOCKED_SOURCES_FILE, 'w') as f:
+                json.dump(locks, f)
+            # فقط برای دیباگ در کنسول چاپ شود
+            print(f"DEBUG: Source '{source_name}' added to locked list.") 
+        except IOError as e:
+            print(f"ERROR: Could not write to locked sources file: {e}")
+
+def clear_locked_sources():
+    """
+    لیست قفل‌ها را پاک می‌کند (برای شروع روز جدید).
+    """
+    try:
+        with open(LOCKED_SOURCES_FILE, 'w') as f:
+            json.dump([], f)
+        print("DEBUG: Locked sources list cleared.")
+    except IOError as e:
+        print(f"ERROR: Could not clear locked sources file: {e}")
+
+# --- پایان زیرساخت ---
+
 
 
 
@@ -380,8 +425,16 @@ limit_max_trades_pattern = re.compile(r'\[LIMIT_MAX_TRADES\]\s+([^,]+),([^,]+),(
 limit_source_dd_pattern = re.compile(r'\[LIMIT_SOURCE_DD\]\s+([^,]+),([^,]+),([^,]+),([^,]+),(\d+)')
 
 
-def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
+source_locked_pattern = re.compile(r'\[SOURCE_LOCKED\]\s+Source\s+(.*?)\s+hit DD limit\s+\((.*?)\)')
+new_day_pattern = re.compile(r'New day started')
 
+source_unlocked_pattern = re.compile(r'\[SOURCE_UNLOCKED_MANUALLY\]\s+Source\s+(.*?)\s+unlocked by user command\.')
+
+
+
+
+
+def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
     line = line.strip()
     if not line:
         return None, None
@@ -390,6 +443,7 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
     trade_data_for_db = None
 
     try:
+        # 1. تشخیص باز شدن معامله
         if match := open_pattern.search(line):
             parts = [p.strip() for p in match.groups()]
             if len(parts) != 7: raise ValueError(f"Invalid OPEN format: {len(parts)} parts")
@@ -408,9 +462,9 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
                 f"*Source Ticket:* `{source_ticket_str}`"
             )
 
+        # 2. تشخیص بسته شدن معامله
         elif match := close_pattern.search(line):
             groups = match.groups()
-            
             copy_id, symbol, source_ticket_str, profit_or_reason_str, source_file, source_account_number_str = [g.strip() for g in groups[:6]]
             
             source_account_number = int(source_account_number_str)
@@ -432,7 +486,6 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
                 
             if len(groups) > 6 and groups[6] and groups[6].strip():
                 extra_reason = groups[6].strip().strip('()')
-                
                 if reason_str:
                     reason_str = f"{reason_str} | {extra_reason}"
                 else:
@@ -457,8 +510,9 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
                 'source_ticket': source_ticket_str
             }
 
+        # 3. هشدارهای دراودان
         elif match := alert_pattern.search(line):
-             parts = [p.strip() for p in match.group(1).split(',')];
+             parts = [p.strip() for p in match.group(1).split(',')]
              if len(parts) != 5: raise ValueError(f"Invalid ALERT format: {len(parts)} parts")
              copy_id, dd, dollar_loss, start_equity, peak_equity = parts
              formatted_message = (f"🟡 *Daily Drawdown Alert*\n\n*Account:* `{copy_id}`\n"
@@ -466,18 +520,17 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
                                 f"*Daily Start Equity:* `${float(start_equity):,.2f}`\n*Daily Peak Equity:* `${float(peak_equity):,.2f}`")
         
         elif match := stop_pattern.search(line):
-             parts = [p.strip() for p in match.group(1).split(',')];
+             parts = [p.strip() for p in match.group(1).split(',')]
              if len(parts) != 6: raise ValueError(f"Invalid STOP format: {len(parts)} parts")
              copy_id, dd, dd_limit, dollar_loss, start_equity, peak_equity = parts
              formatted_message = (f"🔴 *Copy Stopped Due to DD Limit*\n\n*Account:* `{copy_id}`\n"
                                 f"*Loss at Stop:* `%{float(dd):.2f}` `(-${float(dollar_loss):,.2f})`\n"
                                 f"*Stop Threshold:* `%{float(dd_limit):,.2f}`")
 
-        # --- بخش جدید: پردازش پیام تارگت سود ---
+        # 4. تارگت سود
         elif match := profit_stop_pattern.search(line):
              parts = [p.strip() for p in match.group(1).split(',')]
              if len(parts) != 5: raise ValueError(f"Invalid PROFIT_STOP format: {len(parts)} parts")
-             # فرمت لاگ: CopyID, CurrentProfit%, Target%, DollarProfit, StartEquity
              copy_id, current_percent, target_percent, dollar_profit, start_equity = parts
              
              formatted_message = (
@@ -488,24 +541,75 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
                  f"*Start Equity:* `${float(start_equity):,.2f}`\n\n"
                  f"✅ Copying has been paused for the rest of the day to protect profits."
              )
-        # ---------------------------------------
         
+        # 5. ریست شدن قفل دراودان کلی
         elif match := reset_pattern.search(line):
              copy_id = match.group(1).strip()
              details = match.group(2).strip() or "Copying re-enabled"
-
              formatted_message = (
                  f"✅ *Daily DD Lock Released*\n\n"
                  f"*Account:* `{copy_id}`\n"
                  f"*Status:* `{details}`"
              )
+
+        # ==========================================
+        # +++ بخش جدید: مدیریت قفل شدن سورس +++
+        # ==========================================
+        elif match := source_locked_pattern.search(line):
+            source_file = match.group(1).strip()
+            loss_amount = match.group(2).strip()
             
+            # --- اقدام امنیتی: ثبت در لیست سیاه ---
+            add_locked_source(source_file)
+            
+            source_info = source_name_map.get(source_file)
+            source_display_name = source_info['name'] if source_info else source_file
+            
+            formatted_message = (
+                f"⛔️ *Source Locked (Safety Trigger)*\n\n"
+                f"🔻 *Source:* `{source_display_name}`\n"
+                f"📉 *Reason:* Daily DD Limit Hit (`{loss_amount}`)\n"
+                f"🛡 *Action:* Positions closed & Source blocked for today."
+            )
+
+        # ==========================================
+        # +++ بخش جدید: شروع روز جدید (ریست) +++
+        # ==========================================
+        elif match := new_day_pattern.search(line):
+            # --- اقدام امنیتی: پاک کردن لیست سیاه ---
+            clear_locked_sources()
+            
+            formatted_message = (
+                f"☀️ *New Trading Day Started*\n\n"
+                f"🔄 *System Status:* All source locks have been RESET.\n"
+                f"✅ *Ready:* Monitoring started for the new day."
+            )
+            
+
+
+        # ==========================================
+        # +++ بخش جدید: تایید بازگشایی دستی +++
+        # ==========================================
+        elif match := source_unlocked_pattern.search(line):
+            source_file = match.group(1).strip()
+            
+            # پیدا کردن نام نمایشی برای زیبایی پیام
+            source_info = source_name_map.get(source_file)
+            source_display_name = source_info['name'] if source_info else source_file
+            
+            formatted_message = (
+                f"🔓 *Manual Unlock Confirmed*\n\n"
+                f"✅ Source `{source_display_name}` has been successfully unlocked in MetaTrader.\n"
+                f"🚀 Trading resumed for this source."
+            )
+
+
+            
+        # 6. مدیریت خطاها
         elif match := error_pattern.search(line):
              error_message = match.group(1).strip()
-             
              found_benign_key = None
              cooldown_period = 0
-             
              for error_key, cooldown in BENIGN_ERROR_CONFIG.items():
                  if error_key in error_message:
                      found_benign_key = error_key
@@ -515,20 +619,18 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
              if found_benign_key is None:
                  logger.warning(f"Critical error detected: {error_message}", extra={'line': line, 'status': 'critical_error_alert'})
                  formatted_message = f"🚨 *Critical Expert Error*\n\n`{error_message}`"
-             
              else:
                  current_time = time.time()
                  last_sent_time = g_benign_error_last_sent.get(found_benign_key, 0)
-                 
                  if (current_time - last_sent_time) > cooldown_period:
                      logger.info(f"Rate-limited benign error sending: {found_benign_key}", extra={'line': line, 'status': 'benign_error_alert'})
                      formatted_message = f"🟡 *Benign Error (Rate-Limited)*\n\n`{error_message}`"
                      g_benign_error_last_sent[found_benign_key] = current_time
-                 
                  else:
                      logger.debug(f"Ignoring rate-limited benign error (in cooldown): {found_benign_key}", extra={'line': line, 'status': 'benign_error_throttled'})
                      return None, None
 
+        # 7. سایر لیمیت‌ها
         elif match := limit_max_lot_pattern.search(line):
             parts = [p.strip() for p in match.groups()]
             if len(parts) != 4: raise ValueError(f"Invalid LIMIT_MAX_LOT format: {len(parts)} parts")
@@ -574,7 +676,6 @@ def parse_and_format_log_line(line: str) -> tuple[str | None, dict | None]:
         trade_data_for_db = None
 
     return formatted_message, trade_data_for_db
-
 
 
 
